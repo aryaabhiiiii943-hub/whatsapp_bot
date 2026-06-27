@@ -12,7 +12,7 @@ load_dotenv()
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 # CSV setup
-CSV_FILE = r"C:\Users\KIIT\Documents\GitHub\Autonomous-vehicle-perception\automation\orders.csv"
+CSV_FILE = os.path.join(os.getcwd(), "orders.csv")
 
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, 'w', newline='') as f:
@@ -121,4 +121,4 @@ If someone says nhi/nahi/no to adding more items, confirm the final order and cl
     return str(resp)
 
 if __name__ == "__main__":
-    app.run(debug=False, port=5000)
+    app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
