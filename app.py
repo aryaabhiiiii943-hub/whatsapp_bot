@@ -625,16 +625,19 @@ def dashboard():
         except (TypeError, ValueError):
             return 0
 
-    customers = {}
+    # Every order is its own independent, individually-billed record - a customer
+    # ordering twice in one day produces two separate rows with two separate totals,
+    # never a running/lifetime balance. Daily summary just counts+sums per calendar day.
+    daily = {}
     for o in orders:
-        c = customers.setdefault(o["phone"], {
-            "phone": o["phone"], "order_count": 0, "lifetime_total": 0, "last_order": o["timestamp"]
-        })
-        c["order_count"] += 1
-        c["lifetime_total"] += parse_total(o["total"])
-        if o["timestamp"] > c["last_order"]:
-            c["last_order"] = o["timestamp"]
-    customers_list = sorted(customers.values(), key=lambda c: c["last_order"], reverse=True)
+        day = (o["timestamp"] or "")[:10] or "Unknown"
+        d = daily.setdefault(day, {"date": day, "order_count": 0, "day_total": 0})
+        d["order_count"] += 1
+        d["day_total"] += parse_total(o["total"])
+    daily_list = sorted(daily.values(), key=lambda d: d["date"], reverse=True)
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_orders = daily.get(today_str, {"order_count": 0, "day_total": 0})
 
     pending_count = sum(1 for o in orders if (o["order_status"] or "Pending") == "Pending")
     dispatched_count = sum(1 for o in orders if o["order_status"] == "Dispatched")
@@ -695,7 +698,8 @@ def dashboard():
         <div class="stat-card"><h2>{{ pending_count }}</h2><p>Pending</p></div>
         <div class="stat-card"><h2>{{ dispatched_count }}</h2><p>Dispatched</p></div>
         <div class="stat-card"><h2>{{ delivered_count }}</h2><p>Delivered</p></div>
-        <div class="stat-card"><h2>{{ customers|length }}</h2><p>Customers</p></div>
+        <div class="stat-card"><h2>{{ today_orders['order_count'] }}</h2><p>Today's Orders</p></div>
+        <div class="stat-card"><h2>Rs{{ today_orders['day_total'] }}</h2><p>Today's Collection</p></div>
     </div>
     <div class="section">
         <h2>Recent Orders</h2>
@@ -741,27 +745,26 @@ def dashboard():
         {% endif %}
     </div>
     <div class="section">
-        <h2>Customers</h2>
-        {% if customers %}
+        <h2>Daily Summary</h2>
+        {% if daily_list %}
         <table>
-            <tr><th>Phone</th><th>Orders</th><th>Lifetime Total</th><th>Last Order</th></tr>
-            {% for c in customers %}
+            <tr><th>Date</th><th>Orders</th><th>Total Collected</th></tr>
+            {% for d in daily_list %}
             <tr>
-                <td>{{ c['phone'] }}</td>
-                <td>{{ c['order_count'] }}</td>
-                <td>Rs{{ c['lifetime_total'] }}</td>
-                <td>{{ c['last_order'] }}</td>
+                <td>{{ d['date'] }}</td>
+                <td>{{ d['order_count'] }}</td>
+                <td>Rs{{ d['day_total'] }}</td>
             </tr>
             {% endfor %}
         </table>
         {% else %}
-            <div class="no-orders"><p>No customers yet!</p></div>
+            <div class="no-orders"><p>No orders yet!</p></div>
         {% endif %}
     </div>
     <script>setTimeout(() => location.reload(), 30000);</script>
 </body>
 </html>
-    """, orders=orders, customers=customers_list, pending_count=pending_count,
+    """, orders=orders, daily_list=daily_list, today_orders=today_orders, pending_count=pending_count,
          dispatched_count=dispatched_count, delivered_count=delivered_count)
 
 @app.route("/order/<int:order_id>/status", methods=["POST"])
