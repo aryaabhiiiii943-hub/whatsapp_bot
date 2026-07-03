@@ -606,4 +606,56 @@ def privacy():
 <head>
     <title>Privacy Policy - Tandoori Junction</title>
     <meta charset="utf-8">
-    <meta name="viewport
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #222; }
+        h1 { color: #e74c3c; }
+        h2 { margin-top: 32px; font-size: 18px; }
+        p, li { color: #333; }
+    </style>
+</head>
+<body>
+    <h1>Privacy Policy</h1>
+    <p><strong>Tandoori Junction</strong> ("we", "us", "our") operates a WhatsApp ordering assistant to help customers browse our menu and place food orders. This policy explains what information we collect through that service and how we use it.</p>
+
+    <h2>Information we collect</h2>
+    <ul>
+        <li>Your WhatsApp phone number, so we can respond to your messages and process your order.</li>
+        <li>The contents of the messages you send us (e.g. menu selections, quantities).</li>
+        <li>Your delivery location, only if you choose to share it with us via WhatsApp's location-sharing feature.</li>
+    </ul>
+
+    <h2>How we use this information</h2>
+    <ul>
+        <li>To take and confirm your food order.</li>
+        <li>To arrange delivery to the address or location you provide.</li>
+        <li>To contact you about the status of your order.</li>
+    </ul>
+
+    <h2>How we store this information</h2>
+    <p>Order details are stored in a private database used only by Tandoori Junction staff to fulfil orders. We do not sell or share your information with third parties for marketing purposes.</p>
+
+    <h2>Third parties</h2>
+    <p>Messages are sent and received using Meta's WhatsApp Business Platform (Cloud API). Meta's own privacy policy also applies to how they handle message transport: <a href="https://www.whatsapp.com/legal/privacy-policy">https://www.whatsapp.com/legal/privacy-policy</a></p>
+
+    <h2>Your choices</h2>
+    <p>You can stop receiving messages from us at any time by no longer messaging our WhatsApp number, or by asking us to delete your order history.</p>
+
+    <h2>Contact us</h2>
+    <p>{{ restaurant_name }}<br>
+    {{ restaurant_address }}<br>
+    Phone: {{ restaurant_phone }}</p>
+</body>
+</html>
+    """, restaurant_name=os.environ.get("RESTAURANT_NAME", "Tandoori Junction"),
+         restaurant_address=os.environ.get("RESTAURANT_ADDRESS", ""),
+         restaurant_phone=os.environ.get("RESTAURANT_PHONE", ""))
+
+@app.route("/reset")
+def reset():
+    sessions.clear()
+    return "All sessions reset!"
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=False, host="0.0.0.0", port=port)
