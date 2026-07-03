@@ -426,7 +426,7 @@ ORDER_PARSE_SCHEMA = {
     "properties": {
         "intent": {
             "type": "string",
-            "enum": ["greeting", "menu", "category", "order", "cart", "confirm", "cancel", "faq", "back", "unknown"]
+            "enum": ["greeting", "menu", "category", "order", "clear_cart", "cart", "confirm", "cancel", "faq", "back", "unknown"]
         },
         "category_number": {
             "type": "string",
@@ -444,9 +444,10 @@ ORDER_PARSE_SCHEMA = {
                 "additionalProperties": False
             }
         },
+        "clear_cart_first": {"type": "boolean"},
         "clarification_message": {"type": "string"}
     },
-    "required": ["intent", "category_number", "items", "clarification_message"],
+    "required": ["intent", "category_number", "items", "clear_cart_first", "clarification_message"],
     "additionalProperties": False
 }
 
@@ -463,22 +464,26 @@ def parse_message_with_llm(incoming_msg, stage, current_category, cart):
 MENU:
 {MENU_REFERENCE_TEXT}
 
-Conversation state: stage={stage}, current_category={current_cat_name}, cart={cart_summary}
+Conversation state: stage={stage}, current_category={current_cat_name}, current_cart={cart_summary}
 
 Return strict JSON only, following this logic:
 - intent "category": customer wants to browse/see a specific category (by name or number), even mentioned casually (e.g. "chinese kuch dikhao", "pizza hai kya", "biryani wala menu")
-- intent "order": customer is naming specific food item(s) they want, with or without quantity (e.g. "2 chicken biryani aur ek paneer tikka", "mujhe butter naan chahiye")
+- intent "order": customer is EXPLICITLY naming specific food item(s) they want, with or without quantity (e.g. "2 chicken biryani aur ek paneer tikka", "mujhe butter naan chahiye")
+- intent "clear_cart": customer wants to empty/reset their cart without necessarily ordering anything new (e.g. "cart clear karo", "sab hata do", "cart khali karo")
 - intent "cart": customer wants to see their cart/total
 - intent "confirm": customer wants to finalize/confirm their order
 - intent "cancel": customer wants to cancel/start over
 - intent "faq": asking about address, timings, phone, delivery
 - intent "back": wants to go back to the main category menu
 - intent "greeting": hi/hello/namaste etc with no other content
-- intent "unknown": message is unclear or unrelated to ordering
+- intent "unknown": message is a filler/acknowledgment (e.g. "ok", "thik hai", "bas", "accha", "theek hai", "hmm") or otherwise doesn't clearly match any intent above
+
+CRITICAL ANTI-HALLUCINATION RULE: Only ever put something in "items" if the customer's message EXPLICITLY names that specific food item (or an unambiguous typo/Hinglish version of it). NEVER invent, assume, or guess items the customer did not actually mention, even if they are real menu items and even if the conversation state suggests they might want more food. A vague/filler message like "thik hai", "bas", "ok", "done" with no food words in it MUST be classified as intent "unknown" with an EMPTY items array - it is NOT an order.
 
 category_number: "1"-"6" matching the MENU above if intent is "category", else ""
-items: array of {{name, quantity}} using EXACT item names copied from the MENU above, only if intent is "order". Default quantity to 1 if not specified. Never invent items not on the menu - if you can't confidently match an item, omit it from items and explain in clarification_message instead.
-clarification_message: a short, friendly Hinglish message ONLY if the message is genuinely ambiguous or an item couldn't be matched confidently; otherwise an empty string"""
+items: array of {{name, quantity}} using EXACT item names copied from the MENU above, only if intent is "order" AND those exact items were named in the message. Default quantity to 1 if not specified. If you can't confidently match a named item, omit it from items and explain in clarification_message instead.
+clear_cart_first: true if the customer's wording implies REPLACING their current order rather than adding to it (e.g. "sirf X aur kuch nahi", "only X", "bas itna hi chahiye", "cart clear karke X daal do") - this clears the existing cart before adding the new items. Also set true whenever intent is "clear_cart". Otherwise false.
+clarification_message: a short, friendly Hinglish message ONLY if the message is genuinely ambiguous, is a filler/unknown message, or an item couldn't be matched confidently; otherwise an empty string"""
 
     try:
         completion = groq_client.chat.completions.create(
@@ -495,7 +500,7 @@ clarification_message: a short, friendly Hinglish message ONLY if the message is
                     "schema": ORDER_PARSE_SCHEMA
                 }
             },
-            temperature=0.2,
+            temperature=0,
             max_completion_tokens=500
         )
         return json.loads(completion.choices[0].message.content)
@@ -603,7 +608,9 @@ def legacy_intent_reply(session, phone, incoming_msg, intent):
         return finalize_order(session, phone)
     if intent == "cancel":
         session["stage"] = "welcome"
-        return "Koi baat nahi! MENU likhein dobara order karne ke liye."
+        session["cart"] = []
+        session["current_category"] = None
+        return "Koi baat nahi! Cart clear kar diya. MENU likhein dobara order karne ke liye."
     return "Abhi thoda dikkat ho rahi hai samajhne mein. MENU likhein ya item ka number/naam likhein."
 
 @app.route("/dashboard")
@@ -896,10 +903,18 @@ def webhook():
 
                 elif intent == "order":
                     items = parsed.get("items") or []
+                    if parsed.get("clear_cart_first"):
+                        session["cart"] = []
                     if items:
                         reply = add_items_and_reply(session, items)
+                    elif parsed.get("clear_cart_first"):
+                        reply = "Cart clear kar diya! Ab kya order karna hai? Item ka naam likhein."
                     else:
                         reply = parsed.get("clarification_message") or "Kya order karna hai? Item ka naam likhein, jaise 'chicken biryani' ya 'paneer tikka 2'."
+
+                elif intent == "clear_cart":
+                    session["cart"] = []
+                    reply = "Cart clear kar diya! Ab kya order karna hai? Item ka naam likhein, ya MENU likhein dekhne ke liye."
 
                 elif intent == "cart":
                     reply = render_cart_reply(session)
@@ -913,8 +928,10 @@ def webhook():
                         reply = "Cart abhi empty hai! Pehle kuch order karein - item ka naam likhein."
 
                 elif intent == "cancel":
-                    reply = "Koi baat nahi! MENU likhein dobara order karne ke liye."
+                    reply = "Koi baat nahi! Cart clear kar diya. MENU likhein dobara order karne ke liye."
                     session["stage"] = "welcome"
+                    session["cart"] = []
+                    session["current_category"] = None
 
                 elif intent == "faq":
                     reply = FAQ_TEXT
