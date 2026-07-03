@@ -3,7 +3,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 from flask import Flask, request, render_template_string
 from groq import Groq
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import os
 import re
@@ -47,6 +47,18 @@ def init_db():
                 payment_status TEXT DEFAULT 'Pending'
             )
         """)
+        # Safe, idempotent migrations for existing databases that predate these columns.
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(orders)")}
+        migrations = {
+            "order_status": "ALTER TABLE orders ADD COLUMN order_status TEXT DEFAULT 'Pending'",
+            "alert_wamid": "ALTER TABLE orders ADD COLUMN alert_wamid TEXT",
+            "alert_status": "ALTER TABLE orders ADD COLUMN alert_status TEXT DEFAULT 'none'",
+            "alert_retries": "ALTER TABLE orders ADD COLUMN alert_retries INTEGER DEFAULT 0",
+            "alert_last_sent": "ALTER TABLE orders ADD COLUMN alert_last_sent TEXT",
+        }
+        for col, ddl in migrations.items():
+            if col not in existing_cols:
+                conn.execute(ddl)
         conn.commit()
 
 init_db()
@@ -54,13 +66,16 @@ init_db()
 def save_order(phone, order_text, total, location):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with sqlite3.connect(DB_FILE) as conn:
-        conn.execute("""
-            INSERT INTO orders (timestamp, phone, order_text, total, location, payment_status)
-            VALUES (?, ?, ?, ?, ?, 'Pending')
+        cur = conn.execute("""
+            INSERT INTO orders (timestamp, phone, order_text, total, location, payment_status, order_status, alert_status)
+            VALUES (?, ?, ?, ?, ?, 'Pending', 'Pending', 'none')
         """, (timestamp, phone, order_text, total, location or "Not shared"))
         conn.commit()
+        return cur.lastrowid
 
 def send_meta_message(to_phone, text):
+    """Sends a WhatsApp text message. Returns the message's WhatsApp id
+    (wamid) on success so delivery can be tracked, or None on failure."""
     clean_to = str(to_phone).replace("whatsapp:", "").replace("+", "").strip()
     url = f"https://graph.facebook.com/{META_API_VERSION}/{META_PHONE_NUMBER_ID}/messages"
     headers = {
@@ -78,13 +93,68 @@ def send_meta_message(to_phone, text):
         response = requests.post(url, headers=headers, json=payload, timeout=15)
         if response.status_code == 200:
             print(f"Meta send OK: {response.status_code}")
-            return True
+            try:
+                return response.json()["messages"][0]["id"]
+            except (KeyError, IndexError, ValueError):
+                return "unknown"
         else:
             print(f"Meta send FAILED ({response.status_code}): {response.text}")
-            return False
+            return None
     except Exception as e:
         print(f"Meta send error: {e}")
-        return False
+        return None
+
+def build_order_alert_text(row, is_reminder=False):
+    header = "REMINDER - Order Not Yet Confirmed Seen!" if is_reminder else "NEW ORDER - Tandoori Junction"
+    return (
+        f"{header}\n\n"
+        f"Customer: {row['phone']}\n"
+        f"Order:\n{row['order_text']}\n"
+        f"Total: {row['total']}\n"
+        f"Location: {row['location'] or 'Not shared'}\n"
+        f"Time: {row['timestamp']}\n\n"
+        f"Call customer to confirm delivery!"
+    )
+
+def resend_pending_alerts():
+    """Runs on every request (see before_request hook below). Any owner alert
+    that hasn't been confirmed 'delivered'/'read' by WhatsApp within a few
+    minutes gets resent automatically, up to 3 attempts, so a new order can
+    never silently go unnoticed just because a WhatsApp message got lost."""
+    try:
+        cutoff = (datetime.now() - timedelta(minutes=3)).strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("""
+                SELECT * FROM orders
+                WHERE alert_status IN ('sent', 'failed')
+                  AND alert_retries < 3
+                  AND (alert_last_sent IS NULL OR alert_last_sent < ?)
+            """, (cutoff,)).fetchall()
+
+        for row in rows:
+            wamid = send_meta_message(OWNER_NUMBER, build_order_alert_text(row, is_reminder=True))
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.execute(
+                    "UPDATE orders SET alert_wamid=?, alert_status=?, alert_retries=alert_retries+1, alert_last_sent=? WHERE id=?",
+                    (wamid, "sent" if wamid else "failed", now_str, row["id"])
+                )
+                conn.commit()
+    except Exception as e:
+        print(f"resend_pending_alerts error: {e}")
+
+def handle_status_update(status_event):
+    """Processes a WhatsApp delivery-status webhook event (sent/delivered/
+    read/failed) for a previously sent owner alert, so we know whether it
+    still needs to be resent."""
+    wamid = status_event.get("id")
+    status = status_event.get("status")
+    if not wamid or not status:
+        return
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("UPDATE orders SET alert_status=? WHERE alert_wamid=?", (status, wamid))
+        conn.commit()
 
 CATEGORIES = {
     "1": {
@@ -278,6 +348,13 @@ Number bhejo!"""
 
 app = Flask(__name__)
 sessions = {}
+
+@app.before_request
+def _check_pending_alerts():
+    # Piggybacks on any incoming HTTP traffic (webhook calls, keep-alive
+    # pings, dashboard loads) to opportunistically resend any owner order
+    # alert that WhatsApp hasn't confirmed as delivered yet.
+    resend_pending_alerts()
 
 def new_session():
     return {
@@ -482,18 +559,20 @@ def finalize_order(session, phone):
     total_match = re.search(r'TOTAL:\s*Rs(\d+)', session["last_order"])
     total = f"Rs{total_match.group(1)}" if total_match else "N/A"
 
-    save_order(phone, session["last_order"], total, session["location"])
+    order_id = save_order(phone, session["last_order"], total, session["location"])
 
-    alert_msg = (
-        f"NEW ORDER - Tandoori Junction\n\n"
-        f"Customer: {phone}\n"
-        f"Order:\n{session['last_order']}\n"
-        f"Total: {total}\n"
-        f"Location: {session['location'] or 'Not shared'}\n"
-        f"Time: {datetime.now().strftime('%I:%M %p')}\n\n"
-        f"Call customer to confirm delivery!"
-    )
-    send_meta_message(OWNER_NUMBER, alert_msg)
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+
+    wamid = send_meta_message(OWNER_NUMBER, build_order_alert_text(row))
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            "UPDATE orders SET alert_wamid=?, alert_status=?, alert_last_sent=? WHERE id=?",
+            (wamid, "sent" if wamid else "failed", now_str, order_id)
+        )
+        conn.commit()
 
     reply = """Order Confirmed - Tandoori Junction!
 
@@ -533,6 +612,27 @@ def dashboard():
         conn.row_factory = sqlite3.Row
         orders = conn.execute("SELECT * FROM orders ORDER BY id DESC").fetchall()
 
+    def parse_total(t):
+        try:
+            return int(str(t).replace("Rs", "").strip())
+        except (TypeError, ValueError):
+            return 0
+
+    customers = {}
+    for o in orders:
+        c = customers.setdefault(o["phone"], {
+            "phone": o["phone"], "order_count": 0, "lifetime_total": 0, "last_order": o["timestamp"]
+        })
+        c["order_count"] += 1
+        c["lifetime_total"] += parse_total(o["total"])
+        if o["timestamp"] > c["last_order"]:
+            c["last_order"] = o["timestamp"]
+    customers_list = sorted(customers.values(), key=lambda c: c["last_order"], reverse=True)
+
+    pending_count = sum(1 for o in orders if (o["order_status"] or "Pending") == "Pending")
+    dispatched_count = sum(1 for o in orders if o["order_status"] == "Dispatched")
+    delivered_count = sum(1 for o in orders if o["order_status"] == "Delivered")
+
     return render_template_string("""
 <!DOCTYPE html>
 <html>
@@ -546,10 +646,11 @@ def dashboard():
         .header { background: #e74c3c; color: white; padding: 20px; text-align: center; }
         .header h1 { font-size: 24px; }
         .stats { display: flex; gap: 15px; padding: 20px; flex-wrap: wrap; }
-        .stat-card { background: white; border-radius: 10px; padding: 20px; flex: 1; min-width: 150px; text-align: center; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        .stat-card h2 { font-size: 32px; color: #e74c3c; }
-        .stat-card p { color: #666; font-size: 14px; }
-        .orders-section { padding: 0 20px 20px; }
+        .stat-card { background: white; border-radius: 10px; padding: 20px; flex: 1; min-width: 130px; text-align: center; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .stat-card h2 { font-size: 28px; color: #e74c3c; }
+        .stat-card p { color: #666; font-size: 13px; }
+        .section { padding: 0 20px 20px; }
+        .section h2 { padding: 15px 0; }
         .order-card { background: white; border-radius: 10px; padding: 15px; margin-bottom: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border-left: 4px solid #e74c3c; }
         .order-header { display: flex; justify-content: space-between; margin-bottom: 10px; }
         .order-id { font-weight: bold; color: #e74c3c; }
@@ -558,10 +659,23 @@ def dashboard():
         .order-text { background: #f9f9f9; padding: 10px; border-radius: 5px; font-size: 13px; color: #444; margin-bottom: 8px; white-space: pre-wrap; }
         .order-footer { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
         .total { font-weight: bold; color: #27ae60; font-size: 16px; }
-        .status { padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: bold; background: #fff3cd; color: #856404; }
+        .status { padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: bold; }
+        .status-pending { background: #fff3cd; color: #856404; }
+        .status-dispatched { background: #cce5ff; color: #004085; }
+        .status-delivered { background: #d4edda; color: #155724; }
+        .alert-hint { font-size: 11px; color: #999; margin-top: 4px; }
         .location { color: #3498db; font-size: 13px; text-decoration: none; }
         .no-orders { text-align: center; padding: 50px; color: #999; }
         .refresh-btn { background: #e74c3c; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; margin-bottom: 15px; float: right; }
+        .status-btns { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+        .status-btn { border: 1px solid #ddd; background: white; padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+        .status-btn.active { color: white; border: none; }
+        .status-btn.active.p { background: #f1b400; }
+        .status-btn.active.d { background: #007bff; }
+        .status-btn.active.v { background: #28a745; }
+        table { width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        th, td { text-align: left; padding: 12px 15px; font-size: 13px; border-bottom: 1px solid #eee; }
+        th { background: #fafafa; color: #666; }
     </style>
 </head>
 <body>
@@ -570,17 +684,14 @@ def dashboard():
         <p>Order Management</p>
     </div>
     <div class="stats">
-        <div class="stat-card">
-            <h2>{{ orders|length }}</h2>
-            <p>Total Orders</p>
-        </div>
-        <div class="stat-card">
-            <h2>{{ orders|selectattr('payment_status', 'equalto', 'Pending')|list|length }}</h2>
-            <p>Pending</p>
-        </div>
+        <div class="stat-card"><h2>{{ orders|length }}</h2><p>Total Orders</p></div>
+        <div class="stat-card"><h2>{{ pending_count }}</h2><p>Pending</p></div>
+        <div class="stat-card"><h2>{{ dispatched_count }}</h2><p>Dispatched</p></div>
+        <div class="stat-card"><h2>{{ delivered_count }}</h2><p>Delivered</p></div>
+        <div class="stat-card"><h2>{{ customers|length }}</h2><p>Customers</p></div>
     </div>
-    <div class="orders-section">
-        <h2 style="padding: 0 0 15px;">Recent Orders</h2>
+    <div class="section">
+        <h2>Recent Orders</h2>
         <button class="refresh-btn" onclick="location.reload()">Refresh</button>
         <div style="clear:both"></div>
         {% if orders %}
@@ -594,10 +705,27 @@ def dashboard():
                 <div class="order-text">{{ order['order_text'] }}</div>
                 <div class="order-footer">
                     <span class="total">{{ order['total'] }}</span>
-                    <span class="status">{{ order['payment_status'] }}</span>
+                    <span class="status status-{{ (order['order_status'] or 'Pending')|lower }}">{{ order['order_status'] or 'Pending' }}</span>
                     {% if order['location'] and order['location'] != 'Not shared' %}
                     <a class="location" href="{{ order['location'] }}" target="_blank">View Location</a>
                     {% endif %}
+                </div>
+                {% if order['alert_status'] and order['alert_status'] not in ('delivered', 'read') %}
+                <div class="alert-hint">Owner alert not yet confirmed delivered ({{ order['alert_status'] }}, {{ order['alert_retries'] }} retries) - auto-retrying.</div>
+                {% endif %}
+                <div class="status-btns">
+                    <form method="POST" action="/order/{{ order['id'] }}/status" style="display:inline;">
+                        <input type="hidden" name="status" value="Pending">
+                        <button type="submit" class="status-btn {{ 'active p' if (order['order_status'] or 'Pending') == 'Pending' else '' }}">Pending</button>
+                    </form>
+                    <form method="POST" action="/order/{{ order['id'] }}/status" style="display:inline;">
+                        <input type="hidden" name="status" value="Dispatched">
+                        <button type="submit" class="status-btn {{ 'active d' if order['order_status'] == 'Dispatched' else '' }}">Dispatched</button>
+                    </form>
+                    <form method="POST" action="/order/{{ order['id'] }}/status" style="display:inline;">
+                        <input type="hidden" name="status" value="Delivered">
+                        <button type="submit" class="status-btn {{ 'active v' if order['order_status'] == 'Delivered' else '' }}">Delivered</button>
+                    </form>
                 </div>
             </div>
             {% endfor %}
@@ -605,10 +733,39 @@ def dashboard():
             <div class="no-orders"><p>No orders yet!</p></div>
         {% endif %}
     </div>
+    <div class="section">
+        <h2>Customers</h2>
+        {% if customers %}
+        <table>
+            <tr><th>Phone</th><th>Orders</th><th>Lifetime Total</th><th>Last Order</th></tr>
+            {% for c in customers %}
+            <tr>
+                <td>{{ c['phone'] }}</td>
+                <td>{{ c['order_count'] }}</td>
+                <td>Rs{{ c['lifetime_total'] }}</td>
+                <td>{{ c['last_order'] }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
+            <div class="no-orders"><p>No customers yet!</p></div>
+        {% endif %}
+    </div>
     <script>setTimeout(() => location.reload(), 30000);</script>
 </body>
 </html>
-    """, orders=orders)
+    """, orders=orders, customers=customers_list, pending_count=pending_count,
+         dispatched_count=dispatched_count, delivered_count=delivered_count)
+
+@app.route("/order/<int:order_id>/status", methods=["POST"])
+def update_order_status(order_id):
+    new_status = request.form.get("status", "Pending")
+    if new_status not in ("Pending", "Dispatched", "Delivered"):
+        new_status = "Pending"
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("UPDATE orders SET order_status=? WHERE id=?", (new_status, order_id))
+        conn.commit()
+    return ("", 303, {"Location": "/dashboard"})
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
@@ -625,6 +782,11 @@ def webhook():
 
     try:
         value = data["entry"][0]["changes"][0]["value"]
+
+        # Delivery-status updates (sent/delivered/read/failed) for owner alerts
+        for status_event in value.get("statuses", []):
+            handle_status_update(status_event)
+
         messages = value.get("messages", [])
         if not messages:
             return "ok", 200
