@@ -15,6 +15,7 @@ load_dotenv()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 META_PHONE_NUMBER_ID = os.environ.get("META_PHONE_NUMBER_ID")
 META_ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN")
+META_API_VERSION = os.environ.get("META_API_VERSION", "v20.0")
 META_VERIFY_TOKEN = os.environ.get("META_VERIFY_TOKEN", "restaurant-order-bot")  # not a secret, fine as default
 OWNER_NUMBER = os.environ.get("OWNER_WHATSAPP_NUMBER", "918935842629")  # not a secret, fine as default
 
@@ -59,7 +60,7 @@ def save_order(phone, order_text, total, location):
 
 def send_meta_message(to_phone, text):
     clean_to = str(to_phone).replace("whatsapp:", "").replace("+", "").strip()
-    url = f"https://graph.facebook.com/v20.0/{META_PHONE_NUMBER_ID}/messages"
+    url = f"https://graph.facebook.com/{META_API_VERSION}/{META_PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {META_ACCESS_TOKEN}",
         "Content-Type": "application/json"
@@ -73,8 +74,12 @@ def send_meta_message(to_phone, text):
     }
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=15)
-        print(f"Meta send status: {response.status_code}")
-        return response.status_code == 200
+        if response.status_code == 200:
+            print(f"Meta send OK: {response.status_code}")
+            return True
+        else:
+            print(f"Meta send FAILED ({response.status_code}): {response.text}")
+            return False
     except Exception as e:
         print(f"Meta send error: {e}")
         return False
@@ -593,11 +598,12 @@ Shukriya!"""
     send_meta_message(phone, reply)
     return "ok", 200
 
-@app.route("/reset")
-def reset():
-    sessions.clear()
-    return "All sessions reset!"
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(debug=False, host="0.0.0.0", port=port)
+@app.route("/privacy")
+def privacy():
+    return render_template_string("""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Privacy Policy - Tandoori Junction</title>
+    <meta charset="utf-8">
+    <meta name="viewport
