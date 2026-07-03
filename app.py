@@ -471,14 +471,14 @@ Return strict JSON only, following this logic:
 - intent "order": customer is EXPLICITLY naming specific food item(s) they want, with or without quantity (e.g. "2 chicken biryani aur ek paneer tikka", "mujhe butter naan chahiye")
 - intent "clear_cart": customer wants to empty/reset their cart without necessarily ordering anything new (e.g. "cart clear karo", "sab hata do", "cart khali karo")
 - intent "cart": customer wants to see their cart/total
-- intent "confirm": customer wants to finalize/confirm their order
-- intent "cancel": customer wants to cancel/start over
+- intent "confirm": customer is agreeing / saying yes / confirming something (e.g. "haan", "yes", "ha", "confirm", "confirm karo", "done", "bilkul", "sahi hai", "ok kar do", "theek hai kar do"). IMPORTANT: whenever stage is "confirming" (the bot just asked the customer to confirm their order), ANY short affirmative reply - including just "ok", "haan", "yes", "theek hai", "thik hai", "bas kar do" - MUST be classified as "confirm", not "unknown".
+- intent "cancel": customer is saying no / wants to cancel / start over (e.g. "nahi", "no", "nhi", "cancel")
 - intent "faq": asking about address, timings, phone, delivery
 - intent "back": wants to go back to the main category menu
 - intent "greeting": hi/hello/namaste etc with no other content
-- intent "unknown": message is a filler/acknowledgment (e.g. "ok", "thik hai", "bas", "accha", "theek hai", "hmm") or otherwise doesn't clearly match any intent above
+- intent "unknown": ONLY use this when stage is NOT "confirming" and the message is a vague filler/acknowledgment (e.g. "ok", "thik hai", "bas", "accha", "hmm") that doesn't fit any intent above and isn't a reply to a yes/no question
 
-CRITICAL ANTI-HALLUCINATION RULE: Only ever put something in "items" if the customer's message EXPLICITLY names that specific food item (or an unambiguous typo/Hinglish version of it). NEVER invent, assume, or guess items the customer did not actually mention, even if they are real menu items and even if the conversation state suggests they might want more food. A vague/filler message like "thik hai", "bas", "ok", "done" with no food words in it MUST be classified as intent "unknown" with an EMPTY items array - it is NOT an order.
+CRITICAL ANTI-HALLUCINATION RULE: Only ever put something in "items" if the customer's message EXPLICITLY names that specific food item (or an unambiguous typo/Hinglish version of it). NEVER invent, assume, or guess items the customer did not actually mention, even if they are real menu items and even if the conversation state suggests they might want more food. A vague/filler message like "thik hai", "bas", "ok", "done" with no food words in it, sent when stage is NOT "confirming", MUST be classified as intent "unknown" with an EMPTY items array - it is NOT an order.
 
 category_number: "1"-"6" matching the MENU above if intent is "category", else ""
 items: array of {{name, quantity}} using EXACT item names copied from the MENU above, only if intent is "order" AND those exact items were named in the message. Default quantity to 1 if not specified. If you can't confidently match a named item, omit it from items and explain in clarification_message instead.
