@@ -349,6 +349,30 @@ Number bhejo!"""
 app = Flask(__name__)
 sessions = {}
 
+# WhatsApp will retry the webhook call if our server doesn't answer fast
+# enough - very likely on this free Render tier, which can take 50+ seconds
+# to wake from a cold start. Without dedup, a slow cold-start response can
+# cause the SAME customer message (e.g. "haan") to be processed twice,
+# creating a duplicate order and a duplicate owner alert. We remember the
+# last N WhatsApp message ids we've already handled and skip repeats.
+_processed_message_ids = []
+_processed_message_ids_set = set()
+_MAX_PROCESSED_IDS = 500
+
+def _already_processed(message_id):
+    if not message_id:
+        return False
+    if message_id in _processed_message_ids_set:
+        return True
+    _processed_message_ids.append(message_id)
+    _processed_message_ids_set.add(message_id)
+    if len(_processed_message_ids) > _MAX_PROCESSED_IDS:
+        oldest = _processed_message_ids.pop(0)
+        _processed_message_ids_set.discard(oldest)
+    return False
+
+MAX_ITEM_QUANTITY = 20  # sane per-item cap so a stray "50" typo doesn't create a huge accidental order
+
 @app.before_request
 def _check_pending_alerts():
     # Piggybacks on any incoming HTTP traffic (webhook calls, keep-alive
@@ -515,7 +539,7 @@ def resolve_item(name):
     key = name.strip().lower()
     if key in ITEM_LOOKUP:
         return ITEM_LOOKUP[key]
-    close = difflib.get_close_matches(key, ITEM_LOOKUP.keys(), n=1, cutoff=0.6)
+    close = difflib.get_close_matches(key, ITEM_LOOKUP.keys(), n=1, cutoff=0.8)
     if close:
         return ITEM_LOOKUP[close[0]]
     return None
@@ -536,7 +560,7 @@ def add_items_and_reply(session, items):
     for it in items:
         resolved = resolve_item(it.get("name", ""))
         try:
-            qty = max(1, int(it.get("quantity") or 1))
+            qty = max(1, min(MAX_ITEM_QUANTITY, int(it.get("quantity") or 1)))
         except (TypeError, ValueError):
             qty = 1
         if resolved:
@@ -561,10 +585,18 @@ def render_cart_reply(session):
     return "Cart empty hai! Item ka naam bhejein ya MENU likhein order karne ke liye."
 
 def finalize_order(session, phone):
-    total_match = re.search(r'TOTAL:\s*Rs(\d+)', session["last_order"])
-    total = f"Rs{total_match.group(1)}" if total_match else "N/A"
+    # Build the order text/total fresh from the current cart (not the frozen
+    # snapshot taken when location was shared) so that any items added or
+    # changed after sharing location - e.g. "aur ek naan" right before saying
+    # "haan" - are correctly included in what gets saved and sent to the owner.
+    if not session["cart"]:
+        return "Cart abhi empty hai! Pehle kuch order karein - item ka naam likhein."
 
-    order_id = save_order(phone, session["last_order"], total, session["location"])
+    order_text = format_cart(session["cart"])
+    total_num = sum(item["price"] * item["qty"] for item in session["cart"])
+    total = f"Rs{total_num}"
+
+    order_id = save_order(phone, order_text, total, session["location"])
 
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
@@ -590,6 +622,32 @@ Shukriya!"""
     sessions[phone] = new_session()
     return reply
 
+def legacy_parse_items(msg):
+    """Very simple, LLM-free splitter used only when the Groq call fails:
+    breaks a message like '2 chicken biryani aur ek paneer tikka' into
+    candidate item phrases + quantities, so resolve_item()/add_items_and_reply()
+    can still try to match them (or correctly report them as not on the menu),
+    instead of the bot giving up with a generic 'having trouble' message."""
+    parts = re.split(r'\b(?:aur|and)\b|[,+]', msg, flags=re.IGNORECASE)
+    items = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        qty = 1
+        m = re.match(r'^(\d+)\s+(.*)$', part)
+        if m:
+            qty = int(m.group(1))
+            part = m.group(2).strip()
+        else:
+            m2 = re.match(r'^(.*?)\s+(\d+)$', part)
+            if m2:
+                part = m2.group(1).strip()
+                qty = int(m2.group(2))
+        if part:
+            items.append({"name": part, "quantity": qty})
+    return items
+
 def legacy_intent_reply(session, phone, incoming_msg, intent):
     """Fallback used only if the Groq call fails, so the bot stays responsive
     using simple keyword matching instead of natural language understanding."""
@@ -611,6 +669,11 @@ def legacy_intent_reply(session, phone, incoming_msg, intent):
         session["cart"] = []
         session["current_category"] = None
         return "Koi baat nahi! Cart clear kar diya. MENU likhein dobara order karne ke liye."
+    if intent == "order":
+        items = legacy_parse_items(incoming_msg)
+        if items:
+            return add_items_and_reply(session, items)
+        return f"'{incoming_msg}' samajh nahi paaye. MENU likhein poora menu dekhne ke liye, ya item ka sahi naam bhejein."
     return "Abhi thoda dikkat ho rahi hai samajhne mein. MENU likhein ya item ka number/naam likhein."
 
 @app.route("/dashboard")
@@ -805,6 +868,12 @@ def webhook():
         phone = message.get("from", "")
         msg_type = message.get("type", "")
 
+        # WhatsApp retries webhook delivery if we don't respond fast enough
+        # (very possible on this free tier's cold starts) - skip anything
+        # we've already handled so the customer never gets double-processed.
+        if _already_processed(message.get("id")):
+            return "ok", 200
+
         incoming_msg = ""
         latitude = None
         longitude = None
@@ -817,6 +886,11 @@ def webhook():
             longitude = loc.get("longitude")
             incoming_msg = "[location]"
         else:
+            # Sticker/image/audio/document/etc - let the customer know we
+            # noticed instead of going silent, which otherwise looks like
+            # the bot is broken.
+            if phone:
+                send_meta_message(phone, "Hume abhi sirf text messages ya location samajh aati hai. Order karne ke liye item ka naam likhein, ya MENU likhein!")
             return "ok", 200
 
     except (KeyError, IndexError):
@@ -851,7 +925,7 @@ def webhook():
             cat = CATEGORIES.get(session["current_category"])
             items_list = cat["items_list"] if cat else []
             if numeric_pair:
-                item_num, qty = int(numeric_pair.group(1)), int(numeric_pair.group(2))
+                item_num, qty = int(numeric_pair.group(1)), min(MAX_ITEM_QUANTITY, int(numeric_pair.group(2)))
             else:
                 item_num, qty = int(numeric_single.group(1)), 1
 
