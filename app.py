@@ -65,8 +65,19 @@ def require_dashboard_auth(view):
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "orders.db")
 
+def get_db():
+    """Single place all DB access goes through. WAL mode lets the webhook
+    (writing new orders) and the dashboard (reading / updating status) run
+    concurrently without the classic SQLite 'database is locked' crash; the
+    busy_timeout gives any remaining brief contention a few seconds to clear
+    on its own instead of raising immediately."""
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    conn.execute("PRAGMA busy_timeout = 8000")
+    return conn
+
 def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
+    with get_db() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,7 +107,7 @@ init_db()
 
 def save_order(phone, order_text, total, location):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with sqlite3.connect(DB_FILE) as conn:
+    with get_db() as conn:
         cur = conn.execute("""
             INSERT INTO orders (timestamp, phone, order_text, total, location, payment_status, order_status, alert_status)
             VALUES (?, ?, ?, ?, ?, 'Pending', 'Pending', 'none')
@@ -154,7 +165,7 @@ def resend_pending_alerts():
     never silently go unnoticed just because a WhatsApp message got lost."""
     try:
         cutoff = (datetime.now() - timedelta(minutes=3)).strftime("%Y-%m-%d %H:%M:%S")
-        with sqlite3.connect(DB_FILE) as conn:
+        with get_db() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("""
                 SELECT * FROM orders
@@ -166,7 +177,7 @@ def resend_pending_alerts():
         for row in rows:
             wamid = send_meta_message(OWNER_NUMBER, build_order_alert_text(row, is_reminder=True))
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with sqlite3.connect(DB_FILE) as conn:
+            with get_db() as conn:
                 conn.execute(
                     "UPDATE orders SET alert_wamid=?, alert_status=?, alert_retries=alert_retries+1, alert_last_sent=? WHERE id=?",
                     (wamid, "sent" if wamid else "failed", now_str, row["id"])
@@ -183,7 +194,7 @@ def handle_status_update(status_event):
     status = status_event.get("status")
     if not wamid or not status:
         return
-    with sqlite3.connect(DB_FILE) as conn:
+    with get_db() as conn:
         conn.execute("UPDATE orders SET alert_status=? WHERE alert_wamid=?", (status, wamid))
         conn.commit()
 
@@ -771,13 +782,13 @@ def finalize_order(session, phone):
 
     order_id = save_order(phone, order_text, total, session["location"])
 
-    with sqlite3.connect(DB_FILE) as conn:
+    with get_db() as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
 
     wamid = send_meta_message(OWNER_NUMBER, build_order_alert_text(row))
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with sqlite3.connect(DB_FILE) as conn:
+    with get_db() as conn:
         conn.execute(
             "UPDATE orders SET alert_wamid=?, alert_status=?, alert_last_sent=? WHERE id=?",
             (wamid, "sent" if wamid else "failed", now_str, order_id)
@@ -972,44 +983,122 @@ def legacy_intent_reply(session, phone, incoming_msg, intent):
 def get_latest_order_id():
     """Single cheap query used by the dashboard's lightweight polling alert -
     just the max id, not the full order rows."""
-    with sqlite3.connect(DB_FILE) as conn:
+    with get_db() as conn:
         row = conn.execute("SELECT MAX(id) FROM orders").fetchone()
     return row[0] or 0
 
-@app.route("/api/latest_order_id")
-def api_latest_order_id():
-    return {"id": get_latest_order_id()}
+def _parse_total(t):
+    try:
+        return int(str(t).replace("Rs", "").strip())
+    except (TypeError, ValueError):
+        return 0
 
-@app.route("/dashboard")
-@require_dashboard_auth
-def dashboard():
-    with sqlite3.connect(DB_FILE) as conn:
+def _compute_dashboard_data(detail_limit=200):
+    """Everything the dashboard needs, computed fresh from the DB. Split into
+    a cheap full-table scan (just timestamp/total/status - used for the daily
+    summary and status counters, which must always reflect EVERY order ever
+    placed) plus a capped detailed fetch (the last `detail_limit` full order
+    rows shown as cards) so the page doesn't get slower/heavier every single
+    day the restaurant stays open - it stays fast on day 1 and a year from now."""
+    with get_db() as conn:
         conn.row_factory = sqlite3.Row
-        orders = conn.execute("SELECT * FROM orders ORDER BY id DESC").fetchall()
+        light_rows = conn.execute("SELECT timestamp, total, order_status FROM orders").fetchall()
+        total_count = len(light_rows)
+        orders = conn.execute(
+            "SELECT * FROM orders ORDER BY id DESC LIMIT ?", (detail_limit,)
+        ).fetchall()
 
-    def parse_total(t):
-        try:
-            return int(str(t).replace("Rs", "").strip())
-        except (TypeError, ValueError):
-            return 0
-
-    # Every order is its own independent, individually-billed record - a customer
-    # ordering twice in one day produces two separate rows with two separate totals,
-    # never a running/lifetime balance. Daily summary just counts+sums per calendar day.
     daily = {}
-    for o in orders:
+    pending_count = dispatched_count = delivered_count = 0
+    for o in light_rows:
         day = (o["timestamp"] or "")[:10] or "Unknown"
         d = daily.setdefault(day, {"date": day, "order_count": 0, "day_total": 0})
         d["order_count"] += 1
-        d["day_total"] += parse_total(o["total"])
+        d["day_total"] += _parse_total(o["total"])
+        status = o["order_status"] or "Pending"
+        if status == "Dispatched":
+            dispatched_count += 1
+        elif status == "Delivered":
+            delivered_count += 1
+        else:
+            pending_count += 1
     daily_list = sorted(daily.values(), key=lambda d: d["date"], reverse=True)
 
     today_str = datetime.now().strftime("%Y-%m-%d")
     today_orders = daily.get(today_str, {"order_count": 0, "day_total": 0})
 
-    pending_count = sum(1 for o in orders if (o["order_status"] or "Pending") == "Pending")
-    dispatched_count = sum(1 for o in orders if o["order_status"] == "Dispatched")
-    delivered_count = sum(1 for o in orders if o["order_status"] == "Delivered")
+    orders_json = [dict(o) for o in orders]
+
+    return {
+        "orders": orders,
+        "orders_json": orders_json,
+        "daily_list": daily_list,
+        "today_orders": today_orders,
+        "pending_count": pending_count,
+        "dispatched_count": dispatched_count,
+        "delivered_count": delivered_count,
+        "total_count": total_count,
+        "latest_order_id": orders[0]["id"] if orders else 0,
+    }
+
+@app.route("/api/latest_order_id")
+def api_latest_order_id():
+    # Never let a transient DB hiccup crash this - the dashboard's alert
+    # polling depends on this endpoint always returning *something* valid.
+    try:
+        return {"id": get_latest_order_id(), "ok": True}
+    except Exception as e:
+        print(f"api_latest_order_id error: {e}")
+        return {"id": -1, "ok": False}
+
+@app.route("/api/dashboard_data")
+@require_dashboard_auth
+def api_dashboard_data():
+    """JSON version of everything /dashboard shows, used by the page's own
+    JS to refresh itself in place (no full navigation) whenever a new order
+    arrives or on a periodic timer - so an in-progress order never gets
+    interrupted by a page reload, and the connection-status indicator has
+    something real to report on."""
+    try:
+        data = _compute_dashboard_data()
+        return {
+            "ok": True,
+            "orders": data["orders_json"],
+            "daily_list": data["daily_list"],
+            "today_orders": data["today_orders"],
+            "pending_count": data["pending_count"],
+            "dispatched_count": data["dispatched_count"],
+            "delivered_count": data["delivered_count"],
+            "total_count": data["total_count"],
+            "latest_order_id": data["latest_order_id"],
+        }
+    except Exception as e:
+        print(f"api_dashboard_data error: {e}")
+        return {"ok": False, "error": str(e)}, 200
+
+@app.route("/dashboard")
+@require_dashboard_auth
+def dashboard():
+    try:
+        data = _compute_dashboard_data()
+    except Exception as e:
+        print(f"dashboard error: {e}")
+        return (
+            "<html><body style='font-family:Arial;text-align:center;padding:60px;'>"
+            "<h2>Dashboard temporarily unavailable</h2>"
+            "<p>Could not read the orders database. This page will keep retrying "
+            "automatically - please wait a few seconds and tap Refresh.</p>"
+            "<button onclick='location.reload()' style='padding:10px 20px;font-size:16px;'>Refresh</button>"
+            "</body></html>", 200
+        )
+
+    orders = data["orders"]
+    daily_list = data["daily_list"]
+    today_orders = data["today_orders"]
+    pending_count = data["pending_count"]
+    dispatched_count = data["dispatched_count"]
+    delivered_count = data["delivered_count"]
+    total_count = data["total_count"]
 
     return render_template_string("""
 <!DOCTYPE html>
@@ -1021,8 +1110,11 @@ def dashboard():
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: Arial, sans-serif; background: #f5f5f5; }
-        .header { background: #e74c3c; color: white; padding: 20px; text-align: center; }
+        .header { background: #e74c3c; color: white; padding: 20px; text-align: center; position: relative; }
         .header h1 { font-size: 24px; }
+        #connStatus { position: absolute; top: 10px; right: 14px; font-size: 12px; background: rgba(0,0,0,0.2); padding: 4px 10px; border-radius: 12px; }
+        #connStatus.ok { background: rgba(0,0,0,0.2); }
+        #connStatus.bad { background: #c0392b; font-weight: bold; }
         .stats { display: flex; gap: 15px; padding: 20px; flex-wrap: wrap; }
         .stat-card { background: white; border-radius: 10px; padding: 20px; flex: 1; min-width: 130px; text-align: center; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
         .stat-card h2 { font-size: 28px; color: #e74c3c; }
@@ -1051,36 +1143,41 @@ def dashboard():
         .status-btn.active.p { background: #f1b400; }
         .status-btn.active.d { background: #007bff; }
         .status-btn.active.v { background: #28a745; }
+        .status-btn:disabled { opacity: 0.6; cursor: default; }
         table { width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
         th, td { text-align: left; padding: 12px 15px; font-size: 13px; border-bottom: 1px solid #eee; }
         th { background: #fafafa; color: #666; }
-        #newOrderBanner { display: none; position: sticky; top: 0; z-index: 999; background: #28a745; color: white; text-align: center; font-size: 22px; font-weight: bold; padding: 18px; animation: flash 0.6s infinite alternate; }
+        #newOrderBanner { display: none; position: sticky; top: 0; z-index: 999; background: #28a745; color: white; text-align: center; font-size: 22px; font-weight: bold; padding: 18px; animation: flash 0.6s infinite alternate; cursor: pointer; }
         @keyframes flash { from { background: #28a745; } to { background: #1e7e34; } }
         #enableSoundBtn { background: #222; color: white; border: none; padding: 10px 18px; border-radius: 6px; font-size: 14px; cursor: pointer; margin: 10px auto; display: block; }
+        #staleWarning { display: none; background: #fff3cd; color: #856404; text-align: center; padding: 10px; font-size: 13px; }
     </style>
 </head>
 <body>
-    <div id="newOrderBanner">NEW ORDER RECEIVED!</div>
+    <div id="newOrderBanner" onclick="dismissBanner()">NEW ORDER RECEIVED! (tap to dismiss)</div>
+    <div id="staleWarning">Connection lost - alerts may be delayed. Retrying automatically... you can also tap Refresh below.</div>
     <button id="enableSoundBtn" onclick="enableSound()">Tap once to enable order sound alerts</button>
     <div class="header">
+        <span id="connStatus" class="ok">Connecting...</span>
         <h1>Tandoori Junction Dashboard</h1>
         <p>Order Management</p>
     </div>
-    <div class="stats">
-        <div class="stat-card"><h2>{{ orders|length }}</h2><p>Total Orders</p></div>
-        <div class="stat-card"><h2>{{ pending_count }}</h2><p>Pending</p></div>
-        <div class="stat-card"><h2>{{ dispatched_count }}</h2><p>Dispatched</p></div>
-        <div class="stat-card"><h2>{{ delivered_count }}</h2><p>Delivered</p></div>
-        <div class="stat-card"><h2>{{ today_orders['order_count'] }}</h2><p>Today's Orders</p></div>
-        <div class="stat-card"><h2>Rs{{ today_orders['day_total'] }}</h2><p>Today's Collection</p></div>
+    <div class="stats" id="statsContainer">
+        <div class="stat-card"><h2 id="statTotal">{{ total_count }}</h2><p>Total Orders</p></div>
+        <div class="stat-card"><h2 id="statPending">{{ pending_count }}</h2><p>Pending</p></div>
+        <div class="stat-card"><h2 id="statDispatched">{{ dispatched_count }}</h2><p>Dispatched</p></div>
+        <div class="stat-card"><h2 id="statDelivered">{{ delivered_count }}</h2><p>Delivered</p></div>
+        <div class="stat-card"><h2 id="statTodayCount">{{ today_orders['order_count'] }}</h2><p>Today's Orders</p></div>
+        <div class="stat-card"><h2 id="statTodayTotal">Rs{{ today_orders['day_total'] }}</h2><p>Today's Collection</p></div>
     </div>
     <div class="section">
         <h2>Recent Orders</h2>
-        <button class="refresh-btn" onclick="location.reload()">Refresh</button>
+        <button class="refresh-btn" onclick="refreshDashboard(true)">Refresh</button>
         <div style="clear:both"></div>
+        <div id="ordersContainer">
         {% if orders %}
             {% for order in orders %}
-            <div class="order-card">
+            <div class="order-card" data-order-id="{{ order['id'] }}">
                 <div class="order-header">
                     <span class="order-id">Order #{{ order['id'] }}</span>
                     <span class="order-time">{{ order['timestamp'] }}</span>
@@ -1098,27 +1195,20 @@ def dashboard():
                 <div class="alert-hint">Owner alert not yet confirmed delivered ({{ order['alert_status'] }}, {{ order['alert_retries'] }} retries) - auto-retrying.</div>
                 {% endif %}
                 <div class="status-btns">
-                    <form method="POST" action="/order/{{ order['id'] }}/status" style="display:inline;">
-                        <input type="hidden" name="status" value="Pending">
-                        <button type="submit" class="status-btn {{ 'active p' if (order['order_status'] or 'Pending') == 'Pending' else '' }}">Pending</button>
-                    </form>
-                    <form method="POST" action="/order/{{ order['id'] }}/status" style="display:inline;">
-                        <input type="hidden" name="status" value="Dispatched">
-                        <button type="submit" class="status-btn {{ 'active d' if order['order_status'] == 'Dispatched' else '' }}">Dispatched</button>
-                    </form>
-                    <form method="POST" action="/order/{{ order['id'] }}/status" style="display:inline;">
-                        <input type="hidden" name="status" value="Delivered">
-                        <button type="submit" class="status-btn {{ 'active v' if order['order_status'] == 'Delivered' else '' }}">Delivered</button>
-                    </form>
+                    <button type="button" class="status-btn {{ 'active p' if (order['order_status'] or 'Pending') == 'Pending' else '' }}" data-order-id="{{ order['id'] }}" data-status="Pending">Pending</button>
+                    <button type="button" class="status-btn {{ 'active d' if order['order_status'] == 'Dispatched' else '' }}" data-order-id="{{ order['id'] }}" data-status="Dispatched">Dispatched</button>
+                    <button type="button" class="status-btn {{ 'active v' if order['order_status'] == 'Delivered' else '' }}" data-order-id="{{ order['id'] }}" data-status="Delivered">Delivered</button>
                 </div>
             </div>
             {% endfor %}
         {% else %}
             <div class="no-orders"><p>No orders yet!</p></div>
         {% endif %}
+        </div>
     </div>
     <div class="section">
         <h2>Daily Summary</h2>
+        <div id="dailyContainer">
         {% if daily_list %}
         <table>
             <tr><th>Date</th><th>Orders</th><th>Total Collected</th></tr>
@@ -1133,23 +1223,42 @@ def dashboard():
         {% else %}
             <div class="no-orders"><p>No orders yet!</p></div>
         {% endif %}
+        </div>
     </div>
     <script>
-        // Lightweight order alert: one small JSON poll every 5s (no websockets,
-        // no external libs). On a new order id it plays a loud beep + spoken
-        // announcement - if the tablet/PC's default audio output is a paired
-        // Bluetooth speaker, this comes out of that speaker automatically,
-        // no extra integration needed on the code side.
+        // ---------------------------------------------------------------
+        // Reliability layer. Design goals, in order of priority:
+        //   1. Taking/updating an order must NEVER be interrupted by a
+        //      page navigation - so after first load, nothing here calls
+        //      location.reload() during normal operation. All updates are
+        //      done by re-fetching JSON and patching the DOM in place.
+        //   2. A single fetch failure (cold start, wifi blip) must never
+        //      stop the polling loop - every network call is wrapped so
+        //      failures just get logged into the on-screen status pill.
+        //   3. Staff must always be able to tell, at a glance, whether the
+        //      alert system is actually working (connStatus pill) instead
+        //      of silently trusting "no alert = no new orders".
+        // ---------------------------------------------------------------
         var lastSeenId = parseInt(localStorage.getItem('lastSeenOrderId') || '{{ latest_order_id }}', 10);
         var soundEnabled = localStorage.getItem('soundEnabled') === '1';
         var audioCtx = null;
+        var consecutiveFailures = 0;
+        var wakeLock = null;
+
+        function escapeHtml(s) {
+            return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+                return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+            });
+        }
 
         function enableSound() {
             soundEnabled = true;
             localStorage.setItem('soundEnabled', '1');
             document.getElementById('enableSoundBtn').style.display = 'none';
-            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            audioCtx.resume();
+            try {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                audioCtx.resume();
+            } catch (e) {}
             beep(1, 0.15); // quiet confirmation blip so staff know it's on
         }
         if (soundEnabled) {
@@ -1159,8 +1268,9 @@ def dashboard():
         function beep(times, volume) {
             try {
                 if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if (audioCtx.state === 'suspended') audioCtx.resume();
                 for (var i = 0; i < times; i++) {
-                    (function(i) {
+                    (function (i) {
                         setTimeout(function () {
                             var o = audioCtx.createOscillator();
                             var g = audioCtx.createGain();
@@ -1185,24 +1295,181 @@ def dashboard():
             } catch (e) {}
         }
 
+        function dismissBanner() {
+            document.getElementById('newOrderBanner').style.display = 'none';
+        }
+
+        function setConnStatus(ok) {
+            var el = document.getElementById('connStatus');
+            var now = new Date();
+            var t = now.toLocaleTimeString();
+            if (ok) {
+                el.className = 'ok';
+                el.textContent = 'Live - synced ' + t;
+                document.getElementById('staleWarning').style.display = 'none';
+            } else {
+                el.className = 'bad';
+                el.textContent = 'Reconnecting... (' + consecutiveFailures + ')';
+                if (consecutiveFailures >= 3) {
+                    document.getElementById('staleWarning').style.display = 'block';
+                }
+            }
+        }
+
+        function fetchWithTimeout(url, opts, ms) {
+            opts = opts || {};
+            var controller = new AbortController();
+            var id = setTimeout(function () { controller.abort(); }, ms || 8000);
+            opts.signal = controller.signal;
+            return fetch(url, opts).finally(function () { clearTimeout(id); });
+        }
+
+        function renderStats(d) {
+            document.getElementById('statTotal').textContent = d.total_count;
+            document.getElementById('statPending').textContent = d.pending_count;
+            document.getElementById('statDispatched').textContent = d.dispatched_count;
+            document.getElementById('statDelivered').textContent = d.delivered_count;
+            document.getElementById('statTodayCount').textContent = d.today_orders.order_count;
+            document.getElementById('statTodayTotal').textContent = 'Rs' + d.today_orders.day_total;
+        }
+
+        function statusClass(s) { return (s || 'Pending').toLowerCase(); }
+
+        function renderOrders(orders) {
+            var container = document.getElementById('ordersContainer');
+            if (!orders || orders.length === 0) {
+                container.innerHTML = '<div class="no-orders"><p>No orders yet!</p></div>';
+                return;
+            }
+            var html = '';
+            for (var i = 0; i < orders.length; i++) {
+                var o = orders[i];
+                var status = o.order_status || 'Pending';
+                html += '<div class="order-card" data-order-id="' + o.id + '">';
+                html += '<div class="order-header"><span class="order-id">Order #' + o.id + '</span>';
+                html += '<span class="order-time">' + escapeHtml(o.timestamp) + '</span></div>';
+                html += '<div class="order-phone">Phone: ' + escapeHtml(o.phone) + '</div>';
+                html += '<div class="order-text">' + escapeHtml(o.order_text) + '</div>';
+                html += '<div class="order-footer"><span class="total">' + escapeHtml(o.total) + '</span>';
+                html += '<span class="status status-' + statusClass(status) + '">' + escapeHtml(status) + '</span>';
+                if (o.location && o.location !== 'Not shared') {
+                    html += '<a class="location" href="' + escapeHtml(o.location) + '" target="_blank">View Location</a>';
+                }
+                html += '</div>';
+                if (o.alert_status && ['delivered', 'read'].indexOf(o.alert_status) === -1) {
+                    html += '<div class="alert-hint">Owner alert not yet confirmed delivered (' + escapeHtml(o.alert_status) + ', ' + o.alert_retries + ' retries) - auto-retrying.</div>';
+                }
+                html += '<div class="status-btns">';
+                html += '<button type="button" class="status-btn ' + (status === 'Pending' ? 'active p' : '') + '" data-order-id="' + o.id + '" data-status="Pending">Pending</button>';
+                html += '<button type="button" class="status-btn ' + (status === 'Dispatched' ? 'active d' : '') + '" data-order-id="' + o.id + '" data-status="Dispatched">Dispatched</button>';
+                html += '<button type="button" class="status-btn ' + (status === 'Delivered' ? 'active v' : '') + '" data-order-id="' + o.id + '" data-status="Delivered">Delivered</button>';
+                html += '</div></div>';
+            }
+            container.innerHTML = html;
+        }
+
+        function renderDaily(dailyList) {
+            var container = document.getElementById('dailyContainer');
+            if (!dailyList || dailyList.length === 0) {
+                container.innerHTML = '<div class="no-orders"><p>No orders yet!</p></div>';
+                return;
+            }
+            var html = '<table><tr><th>Date</th><th>Orders</th><th>Total Collected</th></tr>';
+            for (var i = 0; i < dailyList.length; i++) {
+                var d = dailyList[i];
+                html += '<tr><td>' + escapeHtml(d.date) + '</td><td>' + d.order_count + '</td><td>Rs' + d.day_total + '</td></tr>';
+            }
+            html += '</table>';
+            container.innerHTML = html;
+        }
+
+        // Event delegation: one listener handles every status button, even
+        // ones that get created later by renderOrders() re-rendering the
+        // container - so this never needs re-attaching.
+        document.getElementById('ordersContainer').addEventListener('click', function (e) {
+            var btn = e.target.closest('.status-btn');
+            if (!btn) return;
+            var orderId = btn.getAttribute('data-order-id');
+            var status = btn.getAttribute('data-status');
+            var group = btn.parentElement.querySelectorAll('.status-btn');
+            group.forEach(function (b) { b.disabled = true; });
+            fetchWithTimeout('/order/' + orderId + '/status', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'X-Requested-With': 'fetch'
+                },
+                body: 'status=' + encodeURIComponent(status)
+            }, 8000).then(function (r) {
+                if (!r.ok) throw new Error('bad response');
+                return refreshDashboard();
+            }).catch(function () {
+                group.forEach(function (b) { b.disabled = false; });
+                alert('Could not update status - check connection and try again.');
+            });
+        });
+
+        function refreshDashboard() {
+            return fetchWithTimeout('/api/dashboard_data', {}, 8000).then(function (r) { return r.json(); }).then(function (data) {
+                if (!data.ok) throw new Error('server reported error');
+                consecutiveFailures = 0;
+                setConnStatus(true);
+                renderStats(data);
+                renderOrders(data.orders);
+                renderDaily(data.daily_list);
+                if (data.latest_order_id > lastSeenId) {
+                    lastSeenId = data.latest_order_id;
+                    localStorage.setItem('lastSeenOrderId', String(lastSeenId));
+                }
+            }).catch(function (e) {
+                consecutiveFailures++;
+                setConnStatus(false);
+            });
+        }
+
         function checkNewOrders() {
-            fetch('/api/latest_order_id').then(function (r) { return r.json(); }).then(function (data) {
+            fetchWithTimeout('/api/latest_order_id', {}, 8000).then(function (r) { return r.json(); }).then(function (data) {
+                if (!data.ok) throw new Error('server reported error');
+                consecutiveFailures = 0;
+                setConnStatus(true);
                 if (data.id && data.id > lastSeenId) {
                     lastSeenId = data.id;
                     localStorage.setItem('lastSeenOrderId', String(lastSeenId));
                     document.getElementById('newOrderBanner').style.display = 'block';
                     if (soundEnabled) announceNewOrder();
-                    setTimeout(function () { location.reload(); }, 5000);
+                    refreshDashboard();
                 }
-            }).catch(function () {});
+            }).catch(function (e) {
+                consecutiveFailures++;
+                setConnStatus(false);
+            });
         }
+
+        async function requestWakeLock() {
+            try {
+                if ('wakeLock' in navigator) {
+                    wakeLock = await navigator.wakeLock.request('screen');
+                }
+            } catch (e) { /* not supported / denied - fine, not critical */ }
+        }
+        requestWakeLock();
+
+        document.addEventListener('visibilitychange', function () {
+            if (document.visibilityState === 'visible') {
+                if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+                requestWakeLock();
+                checkNewOrders();
+            }
+        });
+
         setInterval(checkNewOrders, 5000);
-        setTimeout(function () { location.reload(); }, 120000); // still refresh periodically for status-button updates from other devices
+        setInterval(refreshDashboard, 30000); // safety-net sync so status changes made on another device still show up here
+        refreshDashboard();
     </script>
 </body>
 </html>
     """, orders=orders, daily_list=daily_list, today_orders=today_orders, pending_count=pending_count,
-         dispatched_count=dispatched_count, delivered_count=delivered_count,
+         dispatched_count=dispatched_count, delivered_count=delivered_count, total_count=total_count,
          latest_order_id=(orders[0]["id"] if orders else 0))
 
 @app.route("/order/<int:order_id>/status", methods=["POST"])
@@ -1211,9 +1478,18 @@ def update_order_status(order_id):
     new_status = request.form.get("status", "Pending")
     if new_status not in ("Pending", "Dispatched", "Delivered"):
         new_status = "Pending"
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute("UPDATE orders SET order_status=? WHERE id=?", (new_status, order_id))
-        conn.commit()
+    is_ajax = request.headers.get("X-Requested-With") == "fetch"
+    try:
+        with get_db() as conn:
+            conn.execute("UPDATE orders SET order_status=? WHERE id=?", (new_status, order_id))
+            conn.commit()
+    except Exception as e:
+        print(f"update_order_status error: {e}")
+        if is_ajax:
+            return {"ok": False, "error": str(e)}, 200
+        return ("", 303, {"Location": "/dashboard"})
+    if is_ajax:
+        return {"ok": True, "order_id": order_id, "status": new_status}
     return ("", 303, {"Location": "/dashboard"})
 
 @app.route("/webhook", methods=["GET", "POST"])
