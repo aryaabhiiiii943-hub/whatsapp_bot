@@ -5,10 +5,12 @@ from flask import Flask, request, render_template_string
 from groq import Groq
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from functools import wraps
 import os
 import re
 import json
 import difflib
+import secrets
 import sqlite3
 import requests
 
@@ -31,6 +33,35 @@ if missing:
     raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
+
+# ---------------------------------------------------------------------------
+# Dashboard login (HTTP Basic Auth - no session/cookie machinery needed; the
+# browser caches the credentials after the first prompt, which is all a
+# single shared restaurant tablet/PC needs). Fails CLOSED: if
+# DASHBOARD_PASSWORD isn't set in the environment, the dashboard stays locked
+# rather than silently falling back to being public.
+# ---------------------------------------------------------------------------
+DASHBOARD_USERNAME = os.environ.get("DASHBOARD_USERNAME", "admin")
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD")
+
+def require_dashboard_auth(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        auth = request.authorization
+        ok = bool(
+            DASHBOARD_PASSWORD
+            and auth
+            and secrets.compare_digest(auth.username or "", DASHBOARD_USERNAME)
+            and secrets.compare_digest(auth.password or "", DASHBOARD_PASSWORD)
+        )
+        if not ok:
+            return (
+                "Login required.",
+                401,
+                {"WWW-Authenticate": 'Basic realm="Tandoori Junction Dashboard"'},
+            )
+        return view(*args, **kwargs)
+    return wrapped
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "orders.db")
 
@@ -950,6 +981,7 @@ def api_latest_order_id():
     return {"id": get_latest_order_id()}
 
 @app.route("/dashboard")
+@require_dashboard_auth
 def dashboard():
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
@@ -1174,6 +1206,7 @@ def dashboard():
          latest_order_id=(orders[0]["id"] if orders else 0))
 
 @app.route("/order/<int:order_id>/status", methods=["POST"])
+@require_dashboard_auth
 def update_order_status(order_id):
     new_status = request.form.get("status", "Pending")
     if new_status not in ("Pending", "Dispatched", "Delivered"):
