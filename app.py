@@ -608,18 +608,33 @@ def _agent_state_block(session):
         f"- Delivery location shared: {loc}"
     )
 
+# gpt-oss-20b on Groq has a well-documented quirk: when its answer involves a
+# non-trivial structured payload (i.e. our "actions" array is non-empty), it
+# frequently emits its response through its internal tool-calling channel
+# instead of respecting response_format=json_schema - even though no tool was
+# registered. Groq's API then hard-rejects the whole call with
+# "Tool choice is none, but model called a tool" (400), which silently drops
+# the turn to the dumb legacy keyword fallback. Fix: stop fighting this -
+# register agent_turn as a REAL tool and force the model to call it, which is
+# exactly what it already wants to do. This is deterministic, not a retry hack.
+AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "agent_turn",
+            "description": "Compose the reply to the WhatsApp customer and specify the cart/menu actions (if any) to perform for this turn.",
+            "parameters": AGENT_TURN_SCHEMA,
+        },
+    }
+]
+AGENT_TOOL_CHOICE = {"type": "function", "function": {"name": "agent_turn"}}
+
 def _call_groq_agent(messages):
     kwargs = dict(
         model="openai/gpt-oss-20b",
         messages=messages,
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "agent_turn",
-                "strict": True,
-                "schema": AGENT_TURN_SCHEMA
-            }
-        },
+        tools=AGENT_TOOLS,
+        tool_choice=AGENT_TOOL_CHOICE,
         temperature=0.3,
         max_completion_tokens=1200,  # gpt-oss spends some of this on reasoning tokens
     )
@@ -644,7 +659,15 @@ def run_conversation_agent(session, incoming_msg):
         messages.append({"role": "user", "content": incoming_msg})
     try:
         completion = _call_groq_agent(messages)
-        return json.loads(completion.choices[0].message.content)
+        msg = completion.choices[0].message
+        tool_calls = getattr(msg, "tool_calls", None)
+        if tool_calls:
+            args_str = tool_calls[0].function.arguments
+        else:
+            # Defensive fallback in case a future SDK/model version answers
+            # in plain content instead of a tool call.
+            args_str = msg.content
+        return json.loads(args_str)
     except Exception as e:
         print(f"LLM agent error: {e}")
         return None
