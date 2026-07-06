@@ -938,6 +938,17 @@ def legacy_intent_reply(session, phone, incoming_msg, intent):
         return f"'{incoming_msg}' samajh nahi paaye. MENU likhein poora menu dekhne ke liye, ya item ka sahi naam bhejein."
     return "Abhi thoda dikkat ho rahi hai samajhne mein. MENU likhein ya item ka number/naam likhein."
 
+def get_latest_order_id():
+    """Single cheap query used by the dashboard's lightweight polling alert -
+    just the max id, not the full order rows."""
+    with sqlite3.connect(DB_FILE) as conn:
+        row = conn.execute("SELECT MAX(id) FROM orders").fetchone()
+    return row[0] or 0
+
+@app.route("/api/latest_order_id")
+def api_latest_order_id():
+    return {"id": get_latest_order_id()}
+
 @app.route("/dashboard")
 def dashboard():
     with sqlite3.connect(DB_FILE) as conn:
@@ -1011,9 +1022,14 @@ def dashboard():
         table { width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
         th, td { text-align: left; padding: 12px 15px; font-size: 13px; border-bottom: 1px solid #eee; }
         th { background: #fafafa; color: #666; }
+        #newOrderBanner { display: none; position: sticky; top: 0; z-index: 999; background: #28a745; color: white; text-align: center; font-size: 22px; font-weight: bold; padding: 18px; animation: flash 0.6s infinite alternate; }
+        @keyframes flash { from { background: #28a745; } to { background: #1e7e34; } }
+        #enableSoundBtn { background: #222; color: white; border: none; padding: 10px 18px; border-radius: 6px; font-size: 14px; cursor: pointer; margin: 10px auto; display: block; }
     </style>
 </head>
 <body>
+    <div id="newOrderBanner">NEW ORDER RECEIVED!</div>
+    <button id="enableSoundBtn" onclick="enableSound()">Tap once to enable order sound alerts</button>
     <div class="header">
         <h1>Tandoori Junction Dashboard</h1>
         <p>Order Management</p>
@@ -1086,11 +1102,76 @@ def dashboard():
             <div class="no-orders"><p>No orders yet!</p></div>
         {% endif %}
     </div>
-    <script>setTimeout(() => location.reload(), 30000);</script>
+    <script>
+        // Lightweight order alert: one small JSON poll every 5s (no websockets,
+        // no external libs). On a new order id it plays a loud beep + spoken
+        // announcement - if the tablet/PC's default audio output is a paired
+        // Bluetooth speaker, this comes out of that speaker automatically,
+        // no extra integration needed on the code side.
+        var lastSeenId = parseInt(localStorage.getItem('lastSeenOrderId') || '{{ latest_order_id }}', 10);
+        var soundEnabled = localStorage.getItem('soundEnabled') === '1';
+        var audioCtx = null;
+
+        function enableSound() {
+            soundEnabled = true;
+            localStorage.setItem('soundEnabled', '1');
+            document.getElementById('enableSoundBtn').style.display = 'none';
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            audioCtx.resume();
+            beep(1, 0.15); // quiet confirmation blip so staff know it's on
+        }
+        if (soundEnabled) {
+            document.getElementById('enableSoundBtn').style.display = 'none';
+        }
+
+        function beep(times, volume) {
+            try {
+                if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                for (var i = 0; i < times; i++) {
+                    (function(i) {
+                        setTimeout(function () {
+                            var o = audioCtx.createOscillator();
+                            var g = audioCtx.createGain();
+                            o.type = 'square';
+                            o.frequency.value = 880;
+                            g.gain.value = volume;
+                            o.connect(g); g.connect(audioCtx.destination);
+                            o.start();
+                            setTimeout(function () { o.stop(); }, 350);
+                        }, i * 500);
+                    })(i);
+                }
+            } catch (e) {}
+        }
+
+        function announceNewOrder() {
+            beep(4, 0.9);
+            try {
+                var msg = new SpeechSynthesisUtterance('New order received! New order received!');
+                msg.volume = 1; msg.rate = 1;
+                speechSynthesis.speak(msg);
+            } catch (e) {}
+        }
+
+        function checkNewOrders() {
+            fetch('/api/latest_order_id').then(function (r) { return r.json(); }).then(function (data) {
+                if (data.id && data.id > lastSeenId) {
+                    lastSeenId = data.id;
+                    localStorage.setItem('lastSeenOrderId', String(lastSeenId));
+                    document.getElementById('newOrderBanner').style.display = 'block';
+                    if (soundEnabled) announceNewOrder();
+                    setTimeout(function () { location.reload(); }, 5000);
+                }
+            }).catch(function () {});
+        }
+        setInterval(checkNewOrders, 5000);
+        setTimeout(function () { location.reload(); }, 120000); // still refresh periodically for status-button updates from other devices
+    </script>
 </body>
 </html>
     """, orders=orders, daily_list=daily_list, today_orders=today_orders, pending_count=pending_count,
-         dispatched_count=dispatched_count, delivered_count=delivered_count)
+         dispatched_count=dispatched_count, delivered_count=delivered_count,
+         latest_order_id=(orders[0]["id"] if orders else 0))
 
 @app.route("/order/<int:order_id>/status", methods=["POST"])
 def update_order_status(order_id):
