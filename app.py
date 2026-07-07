@@ -1149,16 +1149,19 @@ def dashboard():
         th { background: #fafafa; color: #666; }
         #newOrderBanner { display: none; position: sticky; top: 0; z-index: 999; background: #28a745; color: white; text-align: center; font-size: 22px; font-weight: bold; padding: 18px; animation: flash 0.6s infinite alternate; cursor: pointer; }
         @keyframes flash { from { background: #28a745; } to { background: #1e7e34; } }
+        #stopAlarmBtn { display: none; position: sticky; top: 0; z-index: 1000; width: 100%; background: #c0392b; color: white; text-align: center; font-size: 20px; font-weight: bold; padding: 22px; border: none; cursor: pointer; animation: alarmFlash 0.4s infinite alternate; }
+        @keyframes alarmFlash { from { background: #c0392b; } to { background: #8e2117; } }
         #enableSoundBtn { background: #222; color: white; border: none; padding: 10px 18px; border-radius: 6px; font-size: 14px; cursor: pointer; margin: 10px auto; display: block; }
         #soundStatusBtn { background: #28a745; color: white; border: none; padding: 6px 14px; border-radius: 14px; font-size: 12px; cursor: pointer; margin: 6px auto; display: block; }
         #staleWarning { display: none; background: #fff3cd; color: #856404; text-align: center; padding: 10px; font-size: 13px; }
     </style>
 </head>
 <body>
-    <div id="newOrderBanner" onclick="dismissBanner()">NEW ORDER RECEIVED! (tap to dismiss)</div>
+    <button id="stopAlarmBtn" onclick="stopAlarm()">NEW ORDER RECEIVED! - tap here to stop the alarm</button>
+    <div id="newOrderBanner" onclick="stopAlarm()">NEW ORDER RECEIVED! (tap to dismiss)</div>
     <div id="staleWarning">Connection lost - alerts may be delayed. Retrying automatically... you can also tap Refresh below.</div>
-    <button id="enableSoundBtn" onclick="enableSound()">Tap once to enable order sound alerts</button>
-    <button id="soundStatusBtn" onclick="enableSound()" style="display:none;">Sound ON - tap to test</button>
+    <button id="enableSoundBtn" onclick="enableSound()">Tap once to enable order alerts (sound + notifications)</button>
+    <button id="soundStatusBtn" onclick="enableSound()" style="display:none;">Alerts ON - tap to test</button>
     <div class="header">
         <span id="connStatus" class="ok">Connecting...</span>
         <h1>Tandoori Junction Dashboard</h1>
@@ -1253,6 +1256,12 @@ def dashboard():
             });
         }
 
+        var originalTitle = document.title;
+        var alarmActive = false;
+        var alarmRepeatInterval = null;
+        var titleFlashInterval = null;
+        var titleFlashOn = false;
+
         function enableSound() {
             soundEnabled = true;
             localStorage.setItem('soundEnabled', '1');
@@ -1263,6 +1272,15 @@ def dashboard():
                 audioCtx.resume();
             } catch (e) {}
             beep(1, 0.15); // quiet confirmation blip so staff know it's on
+            // Ask for OS-level notification permission at the same time -
+            // once granted, a new order shows a real system notification
+            // (like a Gmail/Slack toast) even if this tab isn't focused or
+            // visible, as long as it's still open somewhere.
+            try {
+                if (window.Notification && Notification.permission === 'default') {
+                    Notification.requestPermission();
+                }
+            } catch (e) {}
         }
         if (soundEnabled) {
             // Sound was already enabled in an earlier session (localStorage
@@ -1323,8 +1341,54 @@ def dashboard():
             } catch (e) {}
         }
 
-        function dismissBanner() {
+        // The alarm keeps ringing on a repeat timer - every ~4 seconds -
+        // until a human explicitly taps Stop inside this tab. It does NOT
+        // stop on its own, does not stop when the tab loses focus, and does
+        // not stop just because another order poll succeeds - only the
+        // Stop button (or the banner) clears it. This is deliberate: the
+        // point is that staff can be anywhere (another app, another room
+        // within earshot of the speaker) and the alarm won't go quiet on
+        // its own before someone has actually seen the order.
+        function startAlarm(orderId) {
+            document.getElementById('newOrderBanner').style.display = 'block';
+            document.getElementById('stopAlarmBtn').style.display = 'block';
+            alarmActive = true;
+
+            if (soundEnabled) {
+                announceNewOrder();
+                if (alarmRepeatInterval) clearInterval(alarmRepeatInterval);
+                alarmRepeatInterval = setInterval(function () {
+                    if (alarmActive) announceNewOrder();
+                }, 4000);
+            }
+
+            if (!titleFlashInterval) {
+                titleFlashInterval = setInterval(function () {
+                    document.title = titleFlashOn ? originalTitle : 'NEW ORDER! - Tandoori Junction';
+                    titleFlashOn = !titleFlashOn;
+                }, 1000);
+            }
+
+            try {
+                if (window.Notification && Notification.permission === 'granted') {
+                    var n = new Notification('New order received - Tandoori Junction', {
+                        body: 'Order #' + orderId + ' - open the dashboard to view it. Tap Stop Alarm on the dashboard once handled.',
+                        requireInteraction: true,
+                        tag: 'tandoori-order-' + orderId
+                    });
+                    n.onclick = function () { try { window.focus(); } catch (e) {} };
+                }
+            } catch (e) {}
+        }
+
+        function stopAlarm() {
+            alarmActive = false;
+            if (alarmRepeatInterval) { clearInterval(alarmRepeatInterval); alarmRepeatInterval = null; }
+            if (titleFlashInterval) { clearInterval(titleFlashInterval); titleFlashInterval = null; }
+            document.title = originalTitle;
             document.getElementById('newOrderBanner').style.display = 'none';
+            document.getElementById('stopAlarmBtn').style.display = 'none';
+            try { speechSynthesis.cancel(); } catch (e) {}
         }
 
         function setConnStatus(ok) {
@@ -1474,8 +1538,7 @@ def dashboard():
                 if (data.id && data.id > lastSeenId) {
                     lastSeenId = data.id;
                     localStorage.setItem('lastSeenOrderId', String(lastSeenId));
-                    document.getElementById('newOrderBanner').style.display = 'block';
-                    if (soundEnabled) announceNewOrder();
+                    startAlarm(data.id);
                     refreshDashboard();
                 }
             }).catch(function (e) {
