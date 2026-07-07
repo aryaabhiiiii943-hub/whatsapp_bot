@@ -1,12 +1,14 @@
 # Offline logic tests for the rewritten conversational layer.
-# Stubs groq/dotenv/requests-network so no keys or network are needed.
+# Stubs groq/dotenv/psycopg2 so no keys, real Postgres, or network are needed.
 import os
 import sys
 import types
+import sqlite3 as _real_sqlite3
 
 os.environ["GROQ_API_KEY"] = "test"
 os.environ["META_PHONE_NUMBER_ID"] = "123"
 os.environ["META_ACCESS_TOKEN"] = "test"
+os.environ["DATABASE_URL"] = "postgresql://fake:fake@localhost/fake"
 
 # Stub groq before importing app (SDK may not be installed here)
 fake_groq = types.ModuleType("groq")
@@ -24,6 +26,67 @@ except ImportError:
     d.load_dotenv = lambda *a, **k: None
     sys.modules["dotenv"] = d
 
+# ---------------------------------------------------------------------------
+# Stub psycopg2 with a real SQLite database underneath. app.py's own _q()
+# helper already translates '?' -> '%s' for real Postgres; this fake cursor
+# translates the '%s' back to '?' (plus the couple of DDL syntax differences)
+# so every real SQL statement app.py sends - INSERT/UPDATE/SELECT, RETURNING
+# id, ALTER TABLE ADD COLUMN - actually executes against a real embedded
+# database and is checked for real, instead of being mocked away. This is
+# the same "stub the network dependency, keep the real logic" approach
+# already used above for groq - just applied to the DB driver.
+# ---------------------------------------------------------------------------
+_TEST_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_fake_postgres.db")
+if os.path.exists(_TEST_DB_PATH):
+    os.remove(_TEST_DB_PATH)
+
+def _translate_sql_for_sqlite(sql):
+    sql = sql.replace("%s", "?")
+    sql = sql.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+    sql = sql.replace("ADD COLUMN IF NOT EXISTS", "ADD COLUMN")
+    return sql
+
+class _FakeCursor:
+    def __init__(self, real_cursor):
+        self._c = real_cursor
+    def execute(self, sql, params=()):
+        self._c.execute(_translate_sql_for_sqlite(sql), params)
+        return self
+    def fetchone(self):
+        return self._c.fetchone()
+    def fetchall(self):
+        return self._c.fetchall()
+
+class _FakeConnection:
+    def __init__(self, real_conn):
+        self._conn = real_conn
+    def cursor(self):
+        return _FakeCursor(self._conn.cursor())
+    def commit(self):
+        self._conn.commit()
+    def rollback(self):
+        self._conn.rollback()
+    def close(self):
+        self._conn.close()
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        return self._conn.__exit__(exc_type, exc, tb)
+
+def _fake_connect(dsn, **kwargs):
+    real_conn = _real_sqlite3.connect(_TEST_DB_PATH, timeout=10)
+    real_conn.row_factory = _real_sqlite3.Row
+    return _FakeConnection(real_conn)
+
+fake_psycopg2 = types.ModuleType("psycopg2")
+fake_psycopg2.connect = _fake_connect
+fake_psycopg2_extras = types.ModuleType("psycopg2.extras")
+fake_psycopg2_extras.RealDictCursor = object()  # only referenced as a kwarg value in app.py; unused by the fake
+fake_psycopg2.extras = fake_psycopg2_extras
+sys.modules["psycopg2"] = fake_psycopg2
+sys.modules["psycopg2.extras"] = fake_psycopg2_extras
+
 import app
 
 # Never hit the network
@@ -40,6 +103,15 @@ def check(name, cond, extra=""):
 def fresh(phone="911234567890"):
     app.sessions[phone] = app.new_session()
     return app.sessions[phone], phone
+
+def order_count():
+    with app.get_db() as conn:
+        row = app._q(conn, "SELECT COUNT(*) AS n FROM orders").fetchone()
+        return row["n"]
+
+def last_order_row(cols="*"):
+    with app.get_db() as conn:
+        return app._q(conn, f"SELECT {cols} FROM orders ORDER BY id DESC LIMIT 1").fetchone()
 
 # 1. add_items validates + merges, cart block appended with deterministic total
 s, p = fresh()
@@ -89,10 +161,10 @@ check("replace: total Rs80", "TOTAL: Rs80" in r, r)
 # 7. confirm without location -> asks for location, saves nothing
 s, p = fresh()
 app.add_to_cart(s, "Dal Tadka", 80, 1)
-before = app.sqlite3.connect(app.DB_FILE).execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+before = order_count()
 r = app.execute_agent_actions(s, p, {"reply": "", "actions": [
     {"type": "confirm_order", "category_number": "", "items": []}]})
-after = app.sqlite3.connect(app.DB_FILE).execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+after = order_count()
 check("confirm w/o location: asks for location", "location share" in r, r)
 check("confirm w/o location: no order saved", before == after)
 
@@ -100,11 +172,11 @@ check("confirm w/o location: no order saved", before == after)
 s, p = fresh()
 s["location"] = "https://maps.google.com/?q=1,2"
 app.add_to_cart(s, "Dal Tadka", 80, 1)
-before = app.sqlite3.connect(app.DB_FILE).execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+before = order_count()
 r = app.execute_agent_actions(s, p, {"reply": "", "actions": [
     {"type": "add_items", "category_number": "", "items": [{"name": "Unicorn Curry", "quantity": 1}]},
     {"type": "confirm_order", "category_number": "", "items": []}]})
-after = app.sqlite3.connect(app.DB_FILE).execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+after = order_count()
 check("confirm+unmatched item: blocked", before == after and "nahi mila" in r, r)
 
 # 9. confirm with cart + location -> order saved with deterministic total, session reset, owner alerted
@@ -115,9 +187,9 @@ app.add_to_cart(s, "Butter Naan", 40, 4)
 sent.clear()
 r = app.execute_agent_actions(s, p, {"reply": "Order laga rahi hoon!", "actions": [
     {"type": "confirm_order", "category_number": "", "items": []}]})
-row = app.sqlite3.connect(app.DB_FILE).execute("SELECT total, order_text FROM orders ORDER BY id DESC LIMIT 1").fetchone()
-check("finalize: total Rs460 in DB", row[0] == "Rs460", str(row))
-check("finalize: order_text from real cart", "Chicken Biryani x2 = Rs300" in row[1], row[1])
+row = last_order_row("total, order_text")
+check("finalize: total Rs460 in DB", row["total"] == "Rs460", str(dict(row)))
+check("finalize: order_text from real cart", "Chicken Biryani x2 = Rs300" in row["order_text"], row["order_text"])
 check("finalize: confirmation sent to customer text", "Order Confirmed" in r, r)
 check("finalize: owner alert sent", any(to == app.OWNER_NUMBER for to, _ in sent), str(sent))
 check("finalize: session reset", app.sessions[p]["cart"] == [] and app.sessions[p]["history"] == [])
@@ -188,20 +260,19 @@ s["stage"] = "welcome"
 r = app.legacy_intent_reply(s, p, "menu", "menu")
 check("legacy fallback: menu reply", "Konsi category" in r, r)
 
-# 15. dashboard hardening: WAL mode is on, and _compute_dashboard_data() never
-# crashes even the very first time it runs, returning consistent counts.
-with app.get_db() as _conn:
-    mode = _conn.execute("PRAGMA journal_mode").fetchone()[0]
-check("dashboard: WAL journal mode enabled", mode.lower() == "wal", mode)
-
+# 15. Postgres migration: get_db()/_q() work end-to-end (INSERT..RETURNING id,
+# ALTER TABLE ADD COLUMN IF NOT EXISTS, dict-like row access) and
+# _compute_dashboard_data() never crashes, returning consistent counts.
 data = app._compute_dashboard_data()
 check("dashboard data: has all expected keys", set(["orders", "orders_json", "daily_list", "today_orders",
       "pending_count", "dispatched_count", "delivered_count", "total_count", "latest_order_id"]).issubset(data.keys()))
-check("dashboard data: total_count matches real row count",
-      data["total_count"] == app.sqlite3.connect(app.DB_FILE).execute("SELECT COUNT(*) FROM orders").fetchone()[0])
+check("dashboard data: total_count matches real row count", data["total_count"] == order_count())
 check("dashboard data: pending+dispatched+delivered == total_count",
       data["pending_count"] + data["dispatched_count"] + data["delivered_count"] == data["total_count"],
       str((data["pending_count"], data["dispatched_count"], data["delivered_count"], data["total_count"])))
+
+latest = app.get_latest_order_id()
+check("get_latest_order_id: matches last inserted id", latest == last_order_row("id")["id"], latest)
 
 # 16. status update endpoint: JSON path (X-Requested-With: fetch) returns JSON, not a redirect
 with app.app.test_client() as client:
@@ -209,8 +280,7 @@ with app.app.test_client() as client:
     s["location"] = "https://maps.google.com/?q=1,2"
     app.add_to_cart(s, "Butter Naan", 40, 1)
     app.execute_agent_actions(s, p, {"reply": "", "actions": [{"type": "confirm_order", "category_number": "", "items": []}]})
-    row = app.sqlite3.connect(app.DB_FILE).execute("SELECT id FROM orders ORDER BY id DESC LIMIT 1").fetchone()
-    oid = row[0]
+    oid = last_order_row("id")["id"]
     resp = client.post(f"/order/{oid}/status", data={"status": "Dispatched"},
                         headers={"X-Requested-With": "fetch"},
                         auth=(app.DASHBOARD_USERNAME, app.DASHBOARD_PASSWORD or "x"))

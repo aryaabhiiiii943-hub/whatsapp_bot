@@ -11,7 +11,8 @@ import re
 import json
 import difflib
 import secrets
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import requests
 
 load_dotenv()
@@ -63,24 +64,34 @@ def require_dashboard_auth(view):
         return view(*args, **kwargs)
     return wrapped
 
-DB_FILE = os.path.join(os.path.dirname(__file__), "orders.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("Missing required environment variable: DATABASE_URL")
 
 def get_db():
-    """Single place all DB access goes through. WAL mode lets the webhook
-    (writing new orders) and the dashboard (reading / updating status) run
-    concurrently without the classic SQLite 'database is locked' crash; the
-    busy_timeout gives any remaining brief contention a few seconds to clear
-    on its own instead of raising immediately."""
-    conn = sqlite3.connect(DB_FILE, timeout=10)
-    conn.execute("PRAGMA busy_timeout = 8000")
+    """Single place all DB access goes through. Render Postgres (not the old
+    local SQLite file) - this is what makes order history survive service
+    restarts/redeploys/spin-downs, which the free tier's ephemeral filesystem
+    would otherwise wipe. cursor_factory gives dict-like row access
+    (row['col']) matching how the rest of this file already reads rows."""
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=10,
+                             cursor_factory=psycopg2.extras.RealDictCursor)
     return conn
+
+def _q(conn, sql, params=()):
+    """Thin sqlite3-compatibility shim: the rest of this file was written
+    against sqlite3's conn.execute(sql, params) shortcut and '?' placeholders.
+    psycopg2 needs an explicit cursor and '%s' placeholders - this one-line
+    translation keeps every call site below almost unchanged."""
+    cur = conn.cursor()
+    cur.execute(sql.replace("?", "%s"), params)
+    return cur
 
 def init_db():
     with get_db() as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("""
+        _q(conn, """
             CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 timestamp TEXT,
                 phone TEXT,
                 order_text TEXT,
@@ -89,18 +100,17 @@ def init_db():
                 payment_status TEXT DEFAULT 'Pending'
             )
         """)
-        # Safe, idempotent migrations for existing databases that predate these columns.
-        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(orders)")}
-        migrations = {
-            "order_status": "ALTER TABLE orders ADD COLUMN order_status TEXT DEFAULT 'Pending'",
-            "alert_wamid": "ALTER TABLE orders ADD COLUMN alert_wamid TEXT",
-            "alert_status": "ALTER TABLE orders ADD COLUMN alert_status TEXT DEFAULT 'none'",
-            "alert_retries": "ALTER TABLE orders ADD COLUMN alert_retries INTEGER DEFAULT 0",
-            "alert_last_sent": "ALTER TABLE orders ADD COLUMN alert_last_sent TEXT",
-        }
-        for col, ddl in migrations.items():
-            if col not in existing_cols:
-                conn.execute(ddl)
+        # Safe, idempotent migrations for existing databases that predate these
+        # columns - Postgres supports IF NOT EXISTS directly, no need to check first.
+        migrations = [
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_status TEXT DEFAULT 'Pending'",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS alert_wamid TEXT",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS alert_status TEXT DEFAULT 'none'",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS alert_retries INTEGER DEFAULT 0",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS alert_last_sent TEXT",
+        ]
+        for ddl in migrations:
+            _q(conn, ddl)
         conn.commit()
 
 init_db()
@@ -108,12 +118,14 @@ init_db()
 def save_order(phone, order_text, total, location):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_db() as conn:
-        cur = conn.execute("""
+        cur = _q(conn, """
             INSERT INTO orders (timestamp, phone, order_text, total, location, payment_status, order_status, alert_status)
             VALUES (?, ?, ?, ?, ?, 'Pending', 'Pending', 'none')
+            RETURNING id
         """, (timestamp, phone, order_text, total, location or "Not shared"))
+        new_id = cur.fetchone()["id"]
         conn.commit()
-        return cur.lastrowid
+        return new_id
 
 def send_meta_message(to_phone, text):
     """Sends a WhatsApp text message. Returns the message's WhatsApp id
@@ -166,8 +178,7 @@ def resend_pending_alerts():
     try:
         cutoff = (datetime.now() - timedelta(minutes=3)).strftime("%Y-%m-%d %H:%M:%S")
         with get_db() as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute("""
+            rows = _q(conn, """
                 SELECT * FROM orders
                 WHERE alert_status IN ('sent', 'failed')
                   AND alert_retries < 3
@@ -178,7 +189,7 @@ def resend_pending_alerts():
             wamid = send_meta_message(OWNER_NUMBER, build_order_alert_text(row, is_reminder=True))
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with get_db() as conn:
-                conn.execute(
+                _q(conn,
                     "UPDATE orders SET alert_wamid=?, alert_status=?, alert_retries=alert_retries+1, alert_last_sent=? WHERE id=?",
                     (wamid, "sent" if wamid else "failed", now_str, row["id"])
                 )
@@ -195,7 +206,7 @@ def handle_status_update(status_event):
     if not wamid or not status:
         return
     with get_db() as conn:
-        conn.execute("UPDATE orders SET alert_status=? WHERE alert_wamid=?", (status, wamid))
+        _q(conn, "UPDATE orders SET alert_status=? WHERE alert_wamid=?", (status, wamid))
         conn.commit()
 
 CATEGORIES = {
@@ -783,13 +794,12 @@ def finalize_order(session, phone):
     order_id = save_order(phone, order_text, total, session["location"])
 
     with get_db() as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        row = _q(conn, "SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
 
     wamid = send_meta_message(OWNER_NUMBER, build_order_alert_text(row))
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_db() as conn:
-        conn.execute(
+        _q(conn,
             "UPDATE orders SET alert_wamid=?, alert_status=?, alert_last_sent=? WHERE id=?",
             (wamid, "sent" if wamid else "failed", now_str, order_id)
         )
@@ -984,8 +994,8 @@ def get_latest_order_id():
     """Single cheap query used by the dashboard's lightweight polling alert -
     just the max id, not the full order rows."""
     with get_db() as conn:
-        row = conn.execute("SELECT MAX(id) FROM orders").fetchone()
-    return row[0] or 0
+        row = _q(conn, "SELECT MAX(id) AS max_id FROM orders").fetchone()
+    return (row["max_id"] if row else None) or 0
 
 def _parse_total(t):
     try:
@@ -1001,10 +1011,9 @@ def _compute_dashboard_data(detail_limit=200):
     rows shown as cards) so the page doesn't get slower/heavier every single
     day the restaurant stays open - it stays fast on day 1 and a year from now."""
     with get_db() as conn:
-        conn.row_factory = sqlite3.Row
-        light_rows = conn.execute("SELECT timestamp, total, order_status FROM orders").fetchall()
+        light_rows = _q(conn, "SELECT timestamp, total, order_status FROM orders").fetchall()
         total_count = len(light_rows)
-        orders = conn.execute(
+        orders = _q(conn,
             "SELECT * FROM orders ORDER BY id DESC LIMIT ?", (detail_limit,)
         ).fetchall()
 
@@ -1583,7 +1592,7 @@ def update_order_status(order_id):
     is_ajax = request.headers.get("X-Requested-With") == "fetch"
     try:
         with get_db() as conn:
-            conn.execute("UPDATE orders SET order_status=? WHERE id=?", (new_status, order_id))
+            _q(conn, "UPDATE orders SET order_status=? WHERE id=?", (new_status, order_id))
             conn.commit()
     except Exception as e:
         print(f"update_order_status error: {e}")
