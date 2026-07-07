@@ -1150,6 +1150,7 @@ def dashboard():
         #newOrderBanner { display: none; position: sticky; top: 0; z-index: 999; background: #28a745; color: white; text-align: center; font-size: 22px; font-weight: bold; padding: 18px; animation: flash 0.6s infinite alternate; cursor: pointer; }
         @keyframes flash { from { background: #28a745; } to { background: #1e7e34; } }
         #enableSoundBtn { background: #222; color: white; border: none; padding: 10px 18px; border-radius: 6px; font-size: 14px; cursor: pointer; margin: 10px auto; display: block; }
+        #soundStatusBtn { background: #28a745; color: white; border: none; padding: 6px 14px; border-radius: 14px; font-size: 12px; cursor: pointer; margin: 6px auto; display: block; }
         #staleWarning { display: none; background: #fff3cd; color: #856404; text-align: center; padding: 10px; font-size: 13px; }
     </style>
 </head>
@@ -1157,6 +1158,7 @@ def dashboard():
     <div id="newOrderBanner" onclick="dismissBanner()">NEW ORDER RECEIVED! (tap to dismiss)</div>
     <div id="staleWarning">Connection lost - alerts may be delayed. Retrying automatically... you can also tap Refresh below.</div>
     <button id="enableSoundBtn" onclick="enableSound()">Tap once to enable order sound alerts</button>
+    <button id="soundStatusBtn" onclick="enableSound()" style="display:none;">Sound ON - tap to test</button>
     <div class="header">
         <span id="connStatus" class="ok">Connecting...</span>
         <h1>Tandoori Junction Dashboard</h1>
@@ -1255,15 +1257,41 @@ def dashboard():
             soundEnabled = true;
             localStorage.setItem('soundEnabled', '1');
             document.getElementById('enableSoundBtn').style.display = 'none';
+            document.getElementById('soundStatusBtn').style.display = 'block';
             try {
-                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
                 audioCtx.resume();
             } catch (e) {}
             beep(1, 0.15); // quiet confirmation blip so staff know it's on
         }
         if (soundEnabled) {
+            // Sound was already enabled in an earlier session (localStorage
+            // persists across reloads). We do NOT auto-recreate the audio
+            // context here - a fresh AudioContext made without a real tap
+            // stays browser-suspended and silently never plays anything.
+            // Instead, show a small always-visible "Sound ON" pill (tapping
+            // it re-arms things) AND wire up a page-wide tap-to-resume
+            // listener below, so literally any tap anywhere on the
+            // dashboard (Refresh, a status button, etc.) is enough to
+            // silently un-suspend the audio if it ever goes quiet - staff
+            // never have to hunt for a specific button once sound is on.
             document.getElementById('enableSoundBtn').style.display = 'none';
+            document.getElementById('soundStatusBtn').style.display = 'block';
         }
+
+        // Any tap anywhere on the page counts as a user gesture - use it to
+        // silently resume the audio context if it has gone suspended. This
+        // is the real fix for "sound just stops working after a while":
+        // there is always another chance to recover on the very next tap,
+        // without staff needing to find and press a specific button.
+        document.addEventListener('click', function () {
+            if (soundEnabled) {
+                try {
+                    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                    if (audioCtx.state === 'suspended') audioCtx.resume();
+                } catch (e) {}
+            }
+        }, true);
 
         function beep(times, volume) {
             try {
@@ -1427,7 +1455,18 @@ def dashboard():
             });
         }
 
+        function trySelfHealAudio() {
+            // Best-effort, silent - resume() outside a gesture will simply
+            // no-op/reject in some browsers, which is fine; this just gives
+            // the audio a chance to recover on its own every poll cycle
+            // in addition to the tap-anywhere listener above.
+            if (soundEnabled && audioCtx && audioCtx.state === 'suspended') {
+                audioCtx.resume().catch(function () {});
+            }
+        }
+
         function checkNewOrders() {
+            trySelfHealAudio();
             fetchWithTimeout('/api/latest_order_id', {}, 8000).then(function (r) { return r.json(); }).then(function (data) {
                 if (!data.ok) throw new Error('server reported error');
                 consecutiveFailures = 0;
