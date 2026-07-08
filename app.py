@@ -1166,8 +1166,8 @@ def dashboard():
     </style>
 </head>
 <body>
-    <button id="stopAlarmBtn" onclick="stopAlarm()">NEW ORDER RECEIVED! - tap here to stop the alarm</button>
-    <div id="newOrderBanner" onclick="stopAlarm()">NEW ORDER RECEIVED! (tap to dismiss)</div>
+    <button id="stopAlarmBtn" onclick="confirmOrderReceived()">NEW ORDER RECEIVED! - tap here to stop the alarm</button>
+    <div id="newOrderBanner" onclick="confirmOrderReceived()">NEW ORDER RECEIVED! (tap to confirm)</div>
     <div id="staleWarning">Connection lost - alerts may be delayed. Retrying automatically... you can also tap Refresh below.</div>
     <button id="enableSoundBtn" onclick="enableSound()">Tap once to enable order alerts (sound + notifications)</button>
     <button id="soundStatusBtn" onclick="enableSound()" style="display:none;">Alerts ON - tap to test</button>
@@ -1359,8 +1359,12 @@ def dashboard():
         // within earshot of the speaker) and the alarm won't go quiet on
         // its own before someone has actually seen the order.
         function startAlarm(orderId) {
+            var btn = document.getElementById('stopAlarmBtn');
+            btn.setAttribute('data-order-id', orderId);
+            btn.disabled = false;
+            btn.textContent = 'ORDER #' + orderId + ' RECEIVED! - tap to confirm to customer & stop alarm';
             document.getElementById('newOrderBanner').style.display = 'block';
-            document.getElementById('stopAlarmBtn').style.display = 'block';
+            btn.style.display = 'block';
             alarmActive = true;
 
             if (soundEnabled) {
@@ -1398,6 +1402,38 @@ def dashboard():
             document.getElementById('newOrderBanner').style.display = 'none';
             document.getElementById('stopAlarmBtn').style.display = 'none';
             try { speechSynthesis.cancel(); } catch (e) {}
+        }
+
+        // Staff must explicitly acknowledge a new order before the alarm goes
+        // quiet - tapping the alarm bar/button does NOT just silence it
+        // locally. It first calls the backend to send the customer a "your
+        // order is received" WhatsApp message, and only stops ringing once
+        // that call actually succeeds. If it fails (network blip etc.) the
+        // alarm keeps ringing and the button re-enables so staff can retry -
+        // this guarantees a customer is never silently left without
+        // confirmation just because someone tapped the button once.
+        var ackInFlight = false;
+        function confirmOrderReceived() {
+            if (ackInFlight) return;
+            var btn = document.getElementById('stopAlarmBtn');
+            var orderId = btn.getAttribute('data-order-id');
+            if (!orderId) { stopAlarm(); return; }
+            ackInFlight = true;
+            btn.disabled = true;
+            btn.textContent = 'Confirming with customer...';
+            fetchWithTimeout('/order/' + orderId + '/acknowledge', {
+                method: 'POST',
+                headers: { 'X-Requested-With': 'fetch' }
+            }, 8000).then(function (r) { return r.json(); }).then(function (data) {
+                ackInFlight = false;
+                btn.disabled = false;
+                if (!data.ok) throw new Error(data.error || 'failed');
+                stopAlarm();
+            }).catch(function () {
+                ackInFlight = false;
+                btn.disabled = false;
+                btn.textContent = 'Could not notify customer - tap to retry';
+            });
         }
 
         function setConnStatus(ok) {
@@ -1510,6 +1546,20 @@ def dashboard():
             });
         });
 
+        // Single source of truth for "has this order id already triggered the
+        // alarm". Both polling loops below funnel through this instead of
+        // touching lastSeenId directly, so whichever one notices a new order
+        // first is guaranteed to actually ring the alarm for it.
+        function maybeAlarm(id) {
+            if (id && id > lastSeenId) {
+                lastSeenId = id;
+                localStorage.setItem('lastSeenOrderId', String(lastSeenId));
+                startAlarm(id);
+                return true;
+            }
+            return false;
+        }
+
         function refreshDashboard() {
             return fetchWithTimeout('/api/dashboard_data', {}, 8000).then(function (r) { return r.json(); }).then(function (data) {
                 if (!data.ok) throw new Error('server reported error');
@@ -1518,10 +1568,7 @@ def dashboard():
                 renderStats(data);
                 renderOrders(data.orders);
                 renderDaily(data.daily_list);
-                if (data.latest_order_id > lastSeenId) {
-                    lastSeenId = data.latest_order_id;
-                    localStorage.setItem('lastSeenOrderId', String(lastSeenId));
-                }
+                maybeAlarm(data.latest_order_id);
             }).catch(function (e) {
                 consecutiveFailures++;
                 setConnStatus(false);
@@ -1544,10 +1591,7 @@ def dashboard():
                 if (!data.ok) throw new Error('server reported error');
                 consecutiveFailures = 0;
                 setConnStatus(true);
-                if (data.id && data.id > lastSeenId) {
-                    lastSeenId = data.id;
-                    localStorage.setItem('lastSeenOrderId', String(lastSeenId));
-                    startAlarm(data.id);
+                if (maybeAlarm(data.id)) {
                     refreshDashboard();
                 }
             }).catch(function (e) {
@@ -1582,6 +1626,30 @@ def dashboard():
     """, orders=orders, daily_list=daily_list, today_orders=today_orders, pending_count=pending_count,
          dispatched_count=dispatched_count, delivered_count=delivered_count, total_count=total_count,
          latest_order_id=(orders[0]["id"] if orders else 0))
+
+@app.route("/order/<int:order_id>/acknowledge", methods=["POST"])
+@require_dashboard_auth
+def acknowledge_order(order_id):
+    """Fires when staff taps the alarm button on the dashboard to silence
+    it. Deliberately NOT the same thing as the automatic "Order Confirmed"
+    message the bot already sends the instant a customer places an order -
+    this one specifically tells the customer the restaurant has actually
+    seen and is acting on it, and it only gets sent once a human has taken
+    that action, never automatically."""
+    try:
+        with get_db() as conn:
+            row = _q(conn, "SELECT phone FROM orders WHERE id=?", (order_id,)).fetchone()
+        if not row:
+            return {"ok": False, "error": "order not found"}, 200
+        phone = row["phone"]
+        msg = "Your order has been received by our kitchen and is being prepared! - Tandoori Junction"
+        wamid = send_meta_message(phone, msg)
+        if not wamid:
+            return {"ok": False, "error": "message send failed"}, 200
+        return {"ok": True, "order_id": order_id}
+    except Exception as e:
+        print(f"acknowledge_order error: {e}")
+        return {"ok": False, "error": str(e)}, 200
 
 @app.route("/order/<int:order_id>/status", methods=["POST"])
 @require_dashboard_auth
