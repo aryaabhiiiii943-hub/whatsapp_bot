@@ -1253,7 +1253,16 @@ def dashboard():
         //      alert system is actually working (connStatus pill) instead
         //      of silently trusting "no alert = no new orders".
         // ---------------------------------------------------------------
-        var lastSeenId = parseInt(localStorage.getItem('lastSeenOrderId') || '{{ latest_order_id }}', 10);
+        // Deliberately NOT seeded from localStorage. A cached "last seen
+        // order id" surviving across a database migration/reset (order ids
+        // starting back at 1) would otherwise silently block every future
+        // alarm forever, since every real new id would stay below the old
+        // stale cached number - this is exactly what happened after the
+        // SQLite -> Postgres migration reset ids. The only trustworthy
+        // baseline is what the server just rendered into this page load:
+        // everything already visible in the order list below is, by
+        // definition, already seen.
+        var lastSeenId = parseInt('{{ latest_order_id }}', 10) || 0;
         var soundEnabled = localStorage.getItem('soundEnabled') === '1';
         var audioCtx = null;
         var consecutiveFailures = 0;
