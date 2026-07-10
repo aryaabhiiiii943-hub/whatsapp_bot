@@ -856,7 +856,12 @@ Humare staff aapko call karenge
 
 Shukriya!"""
 
-    save_session(phone, new_session())
+    # Reset in place (not a separate save_session call here) so the webhook
+    # handler's single save at the end of the turn is what persists this -
+    # see the note there for why a second, independent write was actively
+    # harmful.
+    session.clear()
+    session.update(new_session())
     return reply
 
 def execute_agent_actions(session, phone, parsed):
@@ -1847,14 +1852,15 @@ def webhook():
                 print(f"Stage: {session['stage']}, LLM actions: {action_types}")
                 reply = execute_agent_actions(session, phone, parsed)
 
-    # Record what we actually sent, then persist. Reload first: if an order
-    # was just finalized above, finalize_order() already wrote a fresh reset
-    # session to the DB - reloading here (instead of reusing the stale local
-    # `session` object) makes sure the confirmation lands in that new
-    # session's history rather than resurrecting the pre-order one.
-    current_session = load_session(phone)
-    history_append(current_session, "assistant", reply)
-    save_session(phone, current_session)
+    # Record what we actually sent, then persist. Reusing the same in-memory
+    # `session` object the whole turn was built on - NOT reloading it from
+    # the DB here - is essential: the DB hasn't been written yet at this
+    # point, so a reload would silently discard every mutation made this
+    # turn (cart adds, location, stage) and replace it with the stale
+    # pre-turn state. finalize_order() above resets `session` in place when
+    # an order completes, so this single save is correct for both cases.
+    history_append(session, "assistant", reply)
+    save_session(phone, session)
     send_meta_message(phone, reply)
     return "ok", 200
 
