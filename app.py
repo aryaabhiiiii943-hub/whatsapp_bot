@@ -111,6 +111,23 @@ def init_db():
         ]
         for ddl in migrations:
             _q(conn, ddl)
+        # In-progress conversation state (cart, location, chat history) used
+        # to live only in a plain Python dict - fine on a normal server, but
+        # fatal here: the free Render tier spins the whole process down after
+        # ~15 minutes idle, which silently wipes it. A customer who shares
+        # their location, pauses, then comes back and says "Haan" would land
+        # on a brand-new empty session and their confirmation would quietly
+        # fail (asked for location/cart again) with no order ever saved -
+        # this is exactly what happened on 2026-07-10 06:21 (order never
+        # created despite the customer confirming). Persisting sessions here
+        # closes that gap the same way the orders table migration did.
+        _q(conn, """
+            CREATE TABLE IF NOT EXISTS sessions (
+                phone TEXT PRIMARY KEY,
+                data TEXT,
+                updated_at TEXT
+            )
+        """)
         conn.commit()
 
 init_db()
@@ -406,7 +423,6 @@ Konsi category chahiye?
 Number bhejo!"""
 
 app = Flask(__name__)
-sessions = {}
 
 # WhatsApp will retry the webhook call if our server doesn't answer fast
 # enough - very likely on this free Render tier, which can take 50+ seconds
@@ -444,8 +460,9 @@ def _check_pending_alerts():
 # ---------------------------------------------------------------------------
 # history is a plain list of {"role": "user"|"assistant", "content": str}
 # entries - exactly the shape the LLM chat API expects - kept per phone
-# number in the in-memory session (same durability as before: lost on
-# process restart, which is the accepted free-tier limitation).
+# number in a session persisted to Postgres (see load_session/save_session
+# below), so it survives the free tier's ~15-minute idle spin-down instead
+# of silently resetting mid-conversation.
 
 MAX_HISTORY_MESSAGES = 16   # ~8 exchanges of context; enough for "wahi wala" / corrections without blowing up tokens
 MAX_HISTORY_ENTRY_CHARS = 900  # big enough to keep a category listing readable in context
@@ -459,6 +476,32 @@ def new_session():
         "current_category": None,
         "cart": []
     }
+
+def load_session(phone):
+    """Always reads from Postgres, never from the in-memory sessions dict -
+    the dict is gone as of this fix. This is what survives a mid-conversation
+    spin-down: the next message for this phone number picks the cart and
+    location right back up instead of silently starting over."""
+    try:
+        with get_db() as conn:
+            row = _q(conn, "SELECT data FROM sessions WHERE phone=?", (phone,)).fetchone()
+        if row and row["data"]:
+            return json.loads(row["data"])
+    except Exception as e:
+        print(f"load_session error for {phone}: {e}")
+    return new_session()
+
+def save_session(phone, session):
+    try:
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with get_db() as conn:
+            _q(conn, """
+                INSERT INTO sessions (phone, data, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT (phone) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at
+            """, (phone, json.dumps(session), now_str))
+            conn.commit()
+    except Exception as e:
+        print(f"save_session error for {phone}: {e}")
 
 def history_append(session, role, content):
     """Record one conversation turn (both customer messages and everything
@@ -813,7 +856,7 @@ Humare staff aapko call karenge
 
 Shukriya!"""
 
-    sessions[phone] = new_session()
+    save_session(phone, new_session())
     return reply
 
 def execute_agent_actions(session, phone, parsed):
@@ -1738,10 +1781,7 @@ def webhook():
 
     print(f"From {phone}: {incoming_msg}")
 
-    if phone not in sessions:
-        sessions[phone] = new_session()
-
-    session = sessions[phone]
+    session = load_session(phone)
     reply = ""
 
     # Handle location
@@ -1807,10 +1847,14 @@ def webhook():
                 print(f"Stage: {session['stage']}, LLM actions: {action_types}")
                 reply = execute_agent_actions(session, phone, parsed)
 
-    # Record what we actually sent. Note: if an order was just finalized,
-    # sessions[phone] is a fresh session - the confirmation lands in the new
-    # history so the next conversation starts with correct context.
-    history_append(sessions.get(phone) or session, "assistant", reply)
+    # Record what we actually sent, then persist. Reload first: if an order
+    # was just finalized above, finalize_order() already wrote a fresh reset
+    # session to the DB - reloading here (instead of reusing the stale local
+    # `session` object) makes sure the confirmation lands in that new
+    # session's history rather than resurrecting the pre-order one.
+    current_session = load_session(phone)
+    history_append(current_session, "assistant", reply)
+    save_session(phone, current_session)
     send_meta_message(phone, reply)
     return "ok", 200
 
@@ -1869,7 +1913,13 @@ def privacy():
 
 @app.route("/reset")
 def reset():
-    sessions.clear()
+    try:
+        with get_db() as conn:
+            _q(conn, "DELETE FROM sessions")
+            conn.commit()
+    except Exception as e:
+        print(f"reset error: {e}")
+        return f"Reset failed: {e}", 500
     return "All sessions reset!"
 
 if __name__ == "__main__":
