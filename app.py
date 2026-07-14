@@ -784,8 +784,8 @@ Return strict JSON only, following this logic:
 - intent "order": customer is EXPLICITLY naming specific food item(s) they want to BUY, with or without quantity (e.g. "2 chicken biryani aur ek paneer tikka", "mujhe butter naan chahiye")
 - intent "clear_cart": customer wants to empty/reset their cart without necessarily ordering anything new (e.g. "cart clear karo", "sab hata do", "cart khali karo")
 - intent "cart": customer wants to see their cart/total
-- intent "confirm": customer is agreeing / confirming / signaling they're done adding items and ready to checkout (e.g. "haan", "yes", "ha", "confirm", "confirm karo", "done", "done karde", "karde", "bilkul", "sahi hai", "ok kar do", "theek hai kar do", "bas", "bas itna hi", "ho gaya", "yehi order kar do", "isse hi bhej do", "checkout karo"). IMPORTANT: current_cart is {cart_summary} - if the cart is NOT empty, ANY short affirmative/completion-sounding reply MUST be classified as "confirm", not "unknown" - this applies regardless of current stage, not only when the bot just explicitly asked "confirm karna hai?". Customers routinely signal they're done without being asked first.
-- intent "cancel": customer is saying no / wants to cancel / start over (e.g. "nahi", "no", "nhi", "cancel")
+- intent "confirm": the customer is finished adding items and ready to check out - EITHER an affirmative OR a "nothing more" reply (e.g. "haan", "yes", "ha", "confirm", "confirm karo", "done", "ho gaya", "bas", "bas itna hi", "itna hi", "aur kuch nahi", "nahi aur", "nahi bas", "no more", "no thanks", "sahi hai", "theek hai kar do", "order kar do", "checkout karo"). IMPORTANT: current_cart is {cart_summary}. If the cart is NOT empty, ANY short affirmative OR "no more / that is all" style reply MUST be "confirm" - INCLUDING a bare "nahi" / "no" / "nhi", which after we ask "aur kuch chahiye?" means "nothing more to add" and is NOT a cancellation. This applies regardless of stage.
+- intent "cancel": ONLY when the customer explicitly wants to scrap the whole order / start over (e.g. "cancel", "cancel karo", "order cancel", "cancel kar do", "rehne do", "mujhe kuch nahi chahiye", "sab hata do order cancel"). A bare "nahi" / "no" with items already in the cart is NOT cancel - it is "confirm" (nothing more to add), per the rule above.
 - intent "faq": asking about address, timings, phone, delivery
 - intent "back": wants to go back to the main category menu
 - intent "greeting": hi/hello/namaste etc with no other content
@@ -867,12 +867,25 @@ def add_items_and_reply(restaurant, session, items):
 
     parts = []
     if added_lines:
-        parts.append("Cart mein add ho gaya:\n" + "\n".join(f"- {l}" for l in added_lines))
+        session["stage"] = "ordering"
+        parts.append("Add ho gaya:\n" + "\n".join(f"- {l}" for l in added_lines))
+    # If some named items were not on the menu, guide the customer with the
+    # actual menu instead of a dead-end "not found".
     if not_found:
-        parts.append("Yeh menu mein nahi mila: " + ", ".join(not_found) + "\nMENU likhein poora menu dekhne ke liye.")
-    if not parts:
+        parts.append(
+            "Yeh menu mein nahi mila: " + ", ".join(not_found)
+            + ".\nNeeche menu se sahi naam ya number bhejein:\n\n"
+            + restaurant["category_menu"]
+        )
+    if not added_lines and not not_found:
         parts.append("Kuch samajh nahi aaya. MENU likhein poora menu dekhne ke liye.")
-    parts.append("Aur kuch chahiye? Item ka naam likhein, ya CART likhein dekhne ke liye.")
+    if added_lines:
+        total_num = sum(i["price"] * i["qty"] for i in session["cart"])
+        parts.append(
+            f"Ab tak ka total: Rs{total_num}\n\n"
+            "Aur kuch chahiye? Item ka naam likhein.\n"
+            "Ho gaya toh 'DONE' likhein - phir sirf location maangenge."
+        )
     return "\n\n".join(parts)
 
 def render_cart_reply(session):
@@ -887,6 +900,17 @@ def finalize_order(restaurant, session, phone):
     # "haan" - are correctly included in what gets saved and sent to the owner.
     if not session["cart"]:
         return "Cart abhi empty hai! Pehle kuch order karein - item ka naam likhein."
+
+    # Location is mandatory - never place an order without a delivery pin, so
+    # every order that reaches the dashboard/kitchen has a location.
+    if not session.get("location"):
+        session["stage"] = "awaiting_location"
+        return (
+            f"{format_cart(session['cart'])}\n\n"
+            "Order place karne ke liye apni LOCATION bhejein - WhatsApp mein "
+            "clip/attachment > Location > Send your current location.\n"
+            "Location ke bina order place nahi hota."
+        )
 
     order_text = format_order_for_record(session["cart"])
     total_num = sum(item["price"] * item["qty"] for item in session["cart"])
@@ -947,7 +971,7 @@ def legacy_parse_items(msg):
 def legacy_intent_reply(restaurant, session, phone, incoming_msg, intent):
     """Fallback used only if the Groq call fails, so the bot stays responsive
     using simple keyword matching instead of natural language understanding."""
-    if intent == "greeting" or session["stage"] == "new":
+    if intent == "greeting" or (session["stage"] == "new" and intent not in ("order", "menu", "category", "cart", "confirm", "faq", "back")):
         session["stage"] = "welcome"
         return restaurant["greeting_text"]
     if intent in ("menu", "back"):
@@ -958,8 +982,13 @@ def legacy_intent_reply(restaurant, session, phone, incoming_msg, intent):
         return render_cart_reply(session)
     if intent == "faq":
         return restaurant["faq_text"]
-    if intent == "confirm" and session["stage"] == "confirming":
-        return finalize_order(restaurant, session, phone)
+    if intent == "confirm":
+        if session["cart"] and session.get("location"):
+            return finalize_order(restaurant, session, phone)
+        if session["cart"]:
+            session["stage"] = "awaiting_location"
+            return f"{format_cart(session['cart'])}\n\nOrder pakka! Ab apni LOCATION bhejein (attachment > Location). Location milte hi order place ho jayega."
+        return "Cart abhi empty hai! Pehle kuch order karein - item ka naam likhein."
     if intent == "cancel":
         session["stage"] = "welcome"
         session["cart"] = []
@@ -972,17 +1001,283 @@ def legacy_intent_reply(restaurant, session, phone, incoming_msg, intent):
         return f"'{incoming_msg}' samajh nahi paaye. MENU likhein poora menu dekhne ke liye, ya item ka sahi naam bhejein."
     return "Abhi thoda dikkat ho rahi hai samajhne mein. MENU likhein ya item ka number/naam likhein."
 
-@app.route("/dashboard")
-@app.route("/dashboard/<slug>")
-@require_dashboard_auth
-def dashboard(slug="tandoori"):
-    restaurant = SLUG_TO_RESTAURANT.get(slug)
-    if not restaurant:
-        return f"Unknown restaurant '{slug}'. Valid options: {', '.join(SLUG_TO_RESTAURANT.keys())}", 404
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html>
+<head>
+    <title>{{ restaurant['name'] }} Dashboard</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+        body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; background: #0f1115; color: #e8eaed; padding-bottom: 40px; }
+        .topbar { position: sticky; top: 0; z-index: 30; background: #e74c3c; color: #fff; padding: 14px 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; box-shadow: 0 2px 10px rgba(0,0,0,.4); }
+        .topbar h1 { font-size: 18px; line-height: 1.2; }
+        .topbar .sub { font-size: 11px; opacity: .85; }
+        .sound-btn { border: none; border-radius: 10px; font-weight: 800; cursor: pointer; padding: 12px 16px; font-size: 14px; white-space: nowrap; }
+        .sound-btn.off { background: #fff; color: #c0392b; animation: soundPulse 1.1s ease-in-out infinite; }
+        .sound-btn.on { background: rgba(255,255,255,.2); color: #fff; }
+        @keyframes soundPulse { 0%,100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(255,255,255,.6);} 50% { transform: scale(1.05); box-shadow: 0 0 0 10px rgba(255,255,255,0);} }
 
+        .alarm-banner { display: none; position: sticky; top: 58px; z-index: 25; background: #b00000; color: #fff; text-align: center; font-weight: 800; font-size: 17px; padding: 14px; cursor: pointer; animation: bannerFlash .7s steps(1) infinite; }
+        .alarm-banner.show { display: block; }
+        @keyframes bannerFlash { 0%,100% { background: #b00000; } 50% { background: #ff2d2d; } }
+
+        .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; padding: 14px; }
+        .stat { background: #1a1d24; border-radius: 12px; padding: 12px; text-align: center; }
+        .stat b { display: block; font-size: 22px; color: #fff; }
+        .stat span { font-size: 11px; color: #9aa0a6; }
+        .stat.money b { color: #34d399; }
+
+        .section { padding: 4px 14px 14px; }
+        .section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: #9aa0a6; margin: 10px 0; }
+
+        .card { background: #1a1d24; border-radius: 14px; padding: 14px; margin-bottom: 14px; border-left: 5px solid #3a3f4b; }
+        .card.new { border-left-color: #ff2d2d; background: #241416; animation: cardPulse 1s ease-in-out infinite; }
+        @keyframes cardPulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,45,45,.0);} 50% { box-shadow: 0 0 0 4px rgba(255,45,45,.45);} }
+        .card-top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+        .oid { font-weight: 800; font-size: 16px; color: #fff; }
+        .otime { font-size: 12px; color: #9aa0a6; }
+        .newtag { display: inline-block; background: #ff2d2d; color: #fff; font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 20px; margin-left: 8px; vertical-align: middle; }
+        .items { background: #0f1115; border-radius: 10px; padding: 12px; font-size: 16px; line-height: 1.5; white-space: pre-wrap; color: #fff; font-weight: 600; margin-bottom: 10px; }
+        .row { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; font-size: 14px; margin-bottom: 10px; }
+        .total { font-weight: 800; color: #34d399; font-size: 18px; }
+        .pill { padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 700; }
+        .pill.Pending { background: #4a3b00; color: #ffd24d; }
+        .pill.Dispatched { background: #063a63; color: #6db8ff; }
+        .pill.Delivered { background: #0c3d22; color: #52e08e; }
+        a.link { color: #6db8ff; text-decoration: none; font-weight: 700; }
+        .noloc { color: #ff6b6b; font-weight: 700; }
+        .warn { font-size: 11px; color: #c98b00; margin-bottom: 8px; }
+
+        .ack { display: block; width: 100%; background: #ff2d2d; color: #fff; border: none; padding: 14px; border-radius: 10px; font-size: 16px; font-weight: 800; cursor: pointer; margin-bottom: 10px; }
+        .btns { display: grid; grid-template-columns: repeat(3,1fr); gap: 8px; }
+        .btn { border: 1px solid #3a3f4b; background: #23262e; color: #cfd3d8; padding: 12px 6px; border-radius: 10px; font-size: 13px; font-weight: 700; cursor: pointer; }
+        .btn.act.p { background: #f1b400; color: #1a1000; border-color: #f1b400; }
+        .btn.act.d { background: #007bff; color: #fff; border-color: #007bff; }
+        .btn.act.v { background: #28a745; color: #fff; border-color: #28a745; }
+
+        table { width: 100%; border-collapse: collapse; background: #1a1d24; border-radius: 12px; overflow: hidden; }
+        th, td { text-align: left; padding: 10px 12px; font-size: 13px; border-bottom: 1px solid #23262e; }
+        th { color: #9aa0a6; font-weight: 600; }
+        .empty { text-align: center; padding: 40px; color: #6b7280; }
+        .conn { font-size: 11px; color: #6b7280; padding: 0 14px 20px; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="topbar">
+        <div><h1>{{ restaurant['name'] }}</h1><div class="sub">Live Order Board</div></div>
+        <button id="soundBtn" class="sound-btn off" onclick="enableSound()">ENABLE SOUND ALERTS</button>
+    </div>
+    <div id="alarmBanner" class="alarm-banner" onclick="silenceAll()">NEW ORDER - TAP TO SILENCE</div>
+
+    <div class="stats" id="stats"></div>
+
+    <div class="section">
+        <h2>Orders</h2>
+        <div id="orders"></div>
+    </div>
+
+    <div class="section">
+        <h2>Daily Summary</h2>
+        <div id="daily"></div>
+    </div>
+    <div class="conn" id="conn">Live - updates automatically</div>
+
+    <script>
+        const SLUG = "{{ restaurant['slug'] }}";
+        const NAME = "{{ restaurant['name'] }}";
+        const ACK_KEY = "ack_orders_" + SLUG;
+        const SOUND_KEY = "sound_on_" + SLUG;
+        let DATA = {{ initial_json|safe }};
+        let soundOn = localStorage.getItem(SOUND_KEY) === "1";
+        let knownIds = new Set(DATA.orders.map(o => o.id));
+        let audioCtx = null, alarmTimer = null;
+
+        function ackSet() {
+            try { return new Set(JSON.parse(localStorage.getItem(ACK_KEY) || "[]").map(String)); }
+            catch (e) { return new Set(); }
+        }
+        function saveAck(s) { localStorage.setItem(ACK_KEY, JSON.stringify(Array.from(s))); }
+
+        // ---------- LOUD SIREN (Web Audio, no asset needed) ----------
+        function ensureCtx() {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === "suspended") audioCtx.resume();
+            return audioCtx;
+        }
+        function sirenBurst() {
+            const ctx = ensureCtx();
+            const t0 = ctx.currentTime;
+            const notes = [[740,0.0],[988,0.28],[740,0.56],[988,0.84]];
+            notes.forEach(function(n) {
+                const f = n[0], off = n[1], dur = 0.26;
+                const osc = ctx.createOscillator();
+                const g = ctx.createGain();
+                osc.type = "square";
+                osc.frequency.value = f;
+                g.gain.setValueAtTime(0.0001, t0 + off);
+                g.gain.exponentialRampToValueAtTime(0.9, t0 + off + 0.015);
+                g.gain.setValueAtTime(0.9, t0 + off + dur - 0.04);
+                g.gain.exponentialRampToValueAtTime(0.0001, t0 + off + dur);
+                osc.connect(g); g.connect(ctx.destination);
+                osc.start(t0 + off); osc.stop(t0 + off + dur);
+            });
+            if (navigator.vibrate) navigator.vibrate([500, 120, 500]);
+        }
+        function startAlarm() {
+            if (alarmTimer || !soundOn) return;
+            sirenBurst();
+            alarmTimer = setInterval(sirenBurst, 1200);
+        }
+        function stopAlarm() {
+            if (alarmTimer) { clearInterval(alarmTimer); alarmTimer = null; }
+            if (navigator.vibrate) navigator.vibrate(0);
+        }
+
+        function enableSound() {
+            soundOn = true;
+            localStorage.setItem(SOUND_KEY, "1");
+            ensureCtx();
+            sirenBurst();                 // unlock + confirm it is loud
+            setTimeout(stopAlarm, 300);
+            if ("Notification" in window && Notification.permission === "default") Notification.requestPermission();
+            const b = document.getElementById("soundBtn");
+            b.className = "sound-btn on"; b.textContent = "SOUND ON";
+            recompute();
+        }
+        function silenceAll() {
+            // mark every current pending order as seen -> stops the alarm
+            const s = ackSet();
+            DATA.orders.forEach(function(o){ if (o.status === "Pending") s.add(String(o.id)); });
+            saveAck(s);
+            recompute();
+        }
+        function acknowledge(id) { const s = ackSet(); s.add(String(id)); saveAck(s); recompute(); }
+
+        function newOrders() {
+            const ack = ackSet();
+            return DATA.orders.filter(o => o.status === "Pending" && !ack.has(String(o.id)));
+        }
+
+        function esc(x) { const d = document.createElement("div"); d.textContent = (x==null?"":String(x)); return d.innerHTML; }
+        function timeAgo(ts) {
+            const t = Date.parse((ts||"").replace(" ", "T"));
+            if (isNaN(t)) return esc(ts);
+            const m = Math.floor((Date.now() - t) / 60000);
+            if (m < 1) return "just now";
+            if (m < 60) return m + " min ago";
+            const h = Math.floor(m/60); return h + "h " + (m%60) + "m ago";
+        }
+
+        function orderCard(o, isNew) {
+            const loc = (o.location && o.location !== "Not shared")
+                ? '<a class="link" href="' + esc(o.location) + '" target="_blank">View Location</a>'
+                : '<span class="noloc">No location - call customer</span>';
+            const warn = (o.alert_status && o.alert_status !== "delivered" && o.alert_status !== "read")
+                ? '<div class="warn">Owner WhatsApp alert: ' + esc(o.alert_status) + ' (' + o.alert_retries + ' retries)</div>' : '';
+            const ackBtn = isNew ? '<button class="ack" onclick="acknowledge(' + o.id + ')">NEW ORDER - TAP TO ACKNOWLEDGE</button>' : '';
+            const st = o.status;
+            return '' +
+              '<div class="card ' + (isNew ? 'new' : '') + '">' +
+                '<div class="card-top"><span class="oid">Order #' + o.id + (isNew ? '<span class="newtag">NEW</span>' : '') + '</span>' +
+                  '<span class="otime">' + timeAgo(o.timestamp) + '</span></div>' +
+                '<div class="items">' + esc(o.order_text) + '</div>' +
+                '<div class="row"><span class="total">' + esc(o.total) + '</span>' +
+                  '<span class="pill ' + st + '">' + st + '</span>' +
+                  '<a class="link" href="tel:+' + esc(o.phone) + '">Call +' + esc(o.phone) + '</a>' +
+                  '<a class="link" href="https://wa.me/' + esc(o.phone) + '" target="_blank">WhatsApp</a>' +
+                  loc + '</div>' +
+                warn + ackBtn +
+                '<div class="btns">' +
+                  '<button class="btn ' + (st==='Pending'?'act p':'') + '" onclick="setStatus(' + o.id + ',\\'Pending\\')">Pending</button>' +
+                  '<button class="btn ' + (st==='Dispatched'?'act d':'') + '" onclick="setStatus(' + o.id + ',\\'Dispatched\\')">Dispatched</button>' +
+                  '<button class="btn ' + (st==='Delivered'?'act v':'') + '" onclick="setStatus(' + o.id + ',\\'Delivered\\')">Delivered</button>' +
+                '</div>' +
+              '</div>';
+        }
+
+        function render() {
+            const ack = ackSet();
+            const newer = [], rest = [];
+            DATA.orders.forEach(function(o){
+                (o.status === "Pending" && !ack.has(String(o.id))) ? newer.push(o) : rest.push(o);
+            });
+            const oc = document.getElementById("orders");
+            if (!DATA.orders.length) { oc.innerHTML = '<div class="empty">No orders yet</div>'; }
+            else { oc.innerHTML = newer.map(o => orderCard(o, true)).join("") + rest.map(o => orderCard(o, false)).join(""); }
+
+            const s = DATA.stats;
+            document.getElementById("stats").innerHTML =
+                stat(s.total,"Total") + stat(s.pending,"Pending") + stat(s.dispatched,"Dispatched") +
+                stat(s.delivered,"Delivered") + stat(s.today_count,"Today") + stat("Rs"+s.today_total,"Today's Rs","money");
+
+            const d = DATA.daily || [];
+            document.getElementById("daily").innerHTML = d.length
+                ? '<table><tr><th>Date</th><th>Orders</th><th>Collected</th></tr>' +
+                  d.map(x => '<tr><td>' + esc(x.date) + '</td><td>' + x.order_count + '</td><td>Rs' + x.day_total + '</td></tr>').join("") + '</table>'
+                : '<div class="empty">No orders yet</div>';
+        }
+        function stat(v, label, cls) { return '<div class="stat ' + (cls||'') + '"><b>' + esc(v) + '</b><span>' + label + '</span></div>'; }
+
+        function recompute() {
+            render();
+            const n = newOrders().length;
+            const banner = document.getElementById("alarmBanner");
+            if (n > 0 && soundOn) {
+                banner.className = "alarm-banner show";
+                banner.textContent = n + " NEW ORDER" + (n>1?"S":"") + " - TAP TO SILENCE";
+                document.title = "(" + n + ") NEW ORDER - " + NAME;
+                startAlarm();
+            } else {
+                banner.className = "alarm-banner";
+                document.title = NAME + " Dashboard";
+                stopAlarm();
+            }
+        }
+
+        async function setStatus(id, status) {
+            try {
+                const body = new URLSearchParams({ status: status, slug: SLUG, ajax: "1" });
+                await fetch("/order/" + id + "/status", { method: "POST", body: body });
+                const o = DATA.orders.find(x => x.id === id);
+                if (o) o.status = status;
+                if (status !== "Pending") acknowledge(id); else recompute();
+            } catch (e) { console.log("status update failed", e); }
+        }
+
+        async function poll() {
+            try {
+                const res = await fetch("/api/orders/list/" + SLUG, { cache: "no-store" });
+                if (!res.ok) return;
+                DATA = await res.json();
+                let fresh = false;
+                DATA.orders.forEach(function(o){ if (!knownIds.has(o.id)) { knownIds.add(o.id); fresh = true; } });
+                if (fresh && soundOn && "Notification" in window && Notification.permission === "granted") {
+                    new Notification("New order - " + NAME, { body: "Open the board to view it." });
+                }
+                recompute();
+                document.getElementById("conn").textContent = "Live - updated " + new Date().toLocaleTimeString();
+            } catch (e) { document.getElementById("conn").textContent = "Reconnecting..."; }
+        }
+
+        if (soundOn) { const b = document.getElementById("soundBtn"); b.className = "sound-btn on"; b.textContent = "SOUND ON"; }
+        recompute();
+        setInterval(poll, 5000);
+        // keep audio context awake on mobile
+        setInterval(function(){ if (soundOn && audioCtx && audioCtx.state === "suspended") audioCtx.resume(); }, 3000);
+    </script>
+</body>
+</html>"""
+
+
+def _dashboard_payload(restaurant):
+    """Single source of truth for the dashboard, used by both the initial HTML
+    render and the JSON polling endpoint, so the page can refresh itself via
+    fetch() instead of a full reload. Reloads were resetting the browser's
+    audio permission and cutting off the order alarm mid-ring."""
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
-        orders = conn.execute(
+        rows = conn.execute(
             "SELECT * FROM orders WHERE restaurant_id=? ORDER BY id DESC",
             (restaurant["phone_number_id"],),
         ).fetchall()
@@ -993,317 +1288,55 @@ def dashboard(slug="tandoori"):
         except (TypeError, ValueError):
             return 0
 
-    # Every order is its own independent, individually-billed record - a customer
-    # ordering twice in one day produces two separate rows with two separate totals,
-    # never a running/lifetime balance. Daily summary just counts+sums per calendar day.
+    orders = []
     daily = {}
-    for o in orders:
+    for o in rows:
+        st = o["order_status"] or "Pending"
+        orders.append({
+            "id": o["id"],
+            "timestamp": o["timestamp"] or "",
+            "phone": o["phone"] or "",
+            "order_text": o["order_text"] or "",
+            "total": o["total"] or "",
+            "location": o["location"] or "Not shared",
+            "status": st,
+            "alert_status": o["alert_status"] or "",
+            "alert_retries": o["alert_retries"] or 0,
+        })
         day = (o["timestamp"] or "")[:10] or "Unknown"
         d = daily.setdefault(day, {"date": day, "order_count": 0, "day_total": 0})
         d["order_count"] += 1
         d["day_total"] += parse_total(o["total"])
+
     daily_list = sorted(daily.values(), key=lambda d: d["date"], reverse=True)
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_o = daily.get(today, {"order_count": 0, "day_total": 0})
+    stats = {
+        "total": len(orders),
+        "pending": sum(1 for o in orders if o["status"] == "Pending"),
+        "dispatched": sum(1 for o in orders if o["status"] == "Dispatched"),
+        "delivered": sum(1 for o in orders if o["status"] == "Delivered"),
+        "today_count": today_o["order_count"],
+        "today_total": today_o["day_total"],
+    }
+    return {"orders": orders, "stats": stats, "daily": daily_list}
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    today_orders = daily.get(today_str, {"order_count": 0, "day_total": 0})
 
-    pending_count = sum(1 for o in orders if (o["order_status"] or "Pending") == "Pending")
-    dispatched_count = sum(1 for o in orders if o["order_status"] == "Dispatched")
-    delivered_count = sum(1 for o in orders if o["order_status"] == "Delivered")
+@app.route("/dashboard")
+@app.route("/dashboard/<slug>")
+@require_dashboard_auth
+def dashboard(slug="tandoori"):
+    restaurant = SLUG_TO_RESTAURANT.get(slug)
+    if not restaurant:
+        return f"Unknown restaurant '{slug}'. Valid options: {', '.join(SLUG_TO_RESTAURANT.keys())}", 404
+    payload = _dashboard_payload(restaurant)
+    initial_json = json.dumps(payload).replace("<", "\\u003c")
+    return render_template_string(
+        DASHBOARD_HTML,
+        restaurant=restaurant,
+        initial_json=initial_json,
+    )
 
-    return render_template_string("""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>{{ restaurant['name'] }} Dashboard</title>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: Arial, sans-serif; background: #f5f5f5; }
-        .header { background: #e74c3c; color: white; padding: 20px; text-align: center; }
-        .header h1 { font-size: 24px; }
-        .stats { display: flex; gap: 15px; padding: 20px; flex-wrap: wrap; }
-        .stat-card { background: white; border-radius: 10px; padding: 20px; flex: 1; min-width: 130px; text-align: center; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        .stat-card h2 { font-size: 28px; color: #e74c3c; }
-        .stat-card p { color: #666; font-size: 13px; }
-        .section { padding: 0 20px 20px; }
-        .section h2 { padding: 15px 0; }
-        .order-card { background: white; border-radius: 10px; padding: 15px; margin-bottom: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border-left: 4px solid #e74c3c; }
-        .order-header { display: flex; justify-content: space-between; margin-bottom: 10px; }
-        .order-id { font-weight: bold; color: #e74c3c; }
-        .order-time { color: #999; font-size: 13px; }
-        .order-restaurant { display: inline-block; background: #333; color: white; font-size: 11px; padding: 2px 8px; border-radius: 10px; margin-bottom: 6px; }
-        .order-phone { color: #333; font-size: 14px; margin-bottom: 8px; }
-        .order-text { background: #f9f9f9; padding: 10px; border-radius: 5px; font-size: 13px; color: #444; margin-bottom: 8px; white-space: pre-wrap; }
-        .order-footer { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
-        .total { font-weight: bold; color: #27ae60; font-size: 16px; }
-        .status { padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: bold; }
-        .status-pending { background: #fff3cd; color: #856404; }
-        .status-dispatched { background: #cce5ff; color: #004085; }
-        .status-delivered { background: #d4edda; color: #155724; }
-        .alert-hint { font-size: 11px; color: #999; margin-top: 4px; }
-        .location { color: #3498db; font-size: 13px; text-decoration: none; }
-        .no-loc { color: #e74c3c; font-size: 13px; font-weight: bold; }
-        .order-phone a { color: #2c3e50; text-decoration: none; font-weight: bold; }
-        .no-orders { text-align: center; padding: 50px; color: #999; }
-        .refresh-btn { background: #e74c3c; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; margin-bottom: 15px; float: right; }
-        .status-btns { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
-        .status-btn { border: 1px solid #ddd; background: white; padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; }
-        .status-btn.active { color: white; border: none; }
-        .status-btn.active.p { background: #f1b400; }
-        .status-btn.active.d { background: #007bff; }
-        .status-btn.active.v { background: #28a745; }
-        table { width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        th, td { text-align: left; padding: 12px 15px; font-size: 13px; border-bottom: 1px solid #eee; }
-        th { background: #fafafa; color: #666; }
-        .alerts-btn { background: white; color: #e74c3c; border: none; padding: 8px 16px; border-radius: 20px; font-size: 13px; font-weight: bold; cursor: pointer; margin-top: 10px; }
-        .alerts-btn:disabled { background: #ffe5e2; cursor: default; }
-        @keyframes newOrderPulse {
-            0%, 100% { box-shadow: inset 0 0 0 0 rgba(231,76,60,0); }
-            50% { box-shadow: inset 0 0 60px 15px rgba(231,76,60,0.55); }
-        }
-        body.new-order-flash { animation: newOrderPulse 0.7s ease-in-out 6; }
-        .ack-btn { display: block; width: 100%; margin-top: 10px; background: #e74c3c; color: white; border: none; padding: 10px; border-radius: 6px; font-size: 13px; font-weight: bold; cursor: pointer; }
-        .order-card.order-unacknowledged { border-left-color: #ff0000; animation: cardPulse 1s ease-in-out infinite; }
-        @keyframes cardPulse {
-            0%, 100% { box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-            50% { box-shadow: 0 0 0 4px rgba(231,76,60,0.5); }
-        }
-        .order-card:not(.order-unacknowledged) .ack-btn { display: none; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>{{ restaurant['name'] }} Dashboard</h1>
-        <p>Order Management</p>
-        <button id="enable-alerts-btn" class="alerts-btn" onclick="enableAlerts()">Enable Order Alerts</button>
-    </div>
-    <div class="stats">
-        <div class="stat-card"><h2>{{ orders|length }}</h2><p>Total Orders</p></div>
-        <div class="stat-card"><h2>{{ pending_count }}</h2><p>Pending</p></div>
-        <div class="stat-card"><h2>{{ dispatched_count }}</h2><p>Dispatched</p></div>
-        <div class="stat-card"><h2>{{ delivered_count }}</h2><p>Delivered</p></div>
-        <div class="stat-card"><h2>{{ today_orders['order_count'] }}</h2><p>Today's Orders</p></div>
-        <div class="stat-card"><h2>Rs{{ today_orders['day_total'] }}</h2><p>Today's Collection</p></div>
-    </div>
-    <div class="section">
-        <h2>Recent Orders</h2>
-        <button class="refresh-btn" onclick="location.reload()">Refresh</button>
-        <div style="clear:both"></div>
-        {% if orders %}
-            {% for order in orders %}
-            <div class="order-card" data-order-id="{{ order['id'] }}" data-status="{{ order['order_status'] or 'Pending' }}">
-                <div class="order-header">
-                    <span class="order-id">Order #{{ order['id'] }}</span>
-                    <span class="order-time">{{ order['timestamp'] }}</span>
-                </div>
-                <div class="order-phone">Phone: <a href="tel:+{{ order['phone'] }}">+{{ order['phone'] }}</a> &nbsp;|&nbsp; <a href="https://wa.me/{{ order['phone'] }}" target="_blank">WhatsApp</a></div>
-                <div class="order-text">{{ order['order_text'] }}</div>
-                <div class="order-footer">
-                    <span class="total">{{ order['total'] }}</span>
-                    <span class="status status-{{ (order['order_status'] or 'Pending')|lower }}">{{ order['order_status'] or 'Pending' }}</span>
-                    {% if order['location'] and order['location'] != 'Not shared' %}
-                    <a class="location" href="{{ order['location'] }}" target="_blank">View Location</a>
-                    {% else %}
-                    <span class="no-loc">Location not shared - call customer</span>
-                    {% endif %}
-                </div>
-                {% if order['alert_status'] and order['alert_status'] not in ('delivered', 'read') %}
-                <div class="alert-hint">Owner alert not yet confirmed delivered ({{ order['alert_status'] }}, {{ order['alert_retries'] }} retries) - auto-retrying.</div>
-                {% endif %}
-                {% if (order['order_status'] or 'Pending') == 'Pending' %}
-                <button class="ack-btn" onclick="acknowledgeOrder('{{ order['id'] }}')">New Order - Click to Acknowledge</button>
-                {% endif %}
-                <div class="status-btns">
-                    <form method="POST" action="/order/{{ order['id'] }}/status" style="display:inline;">
-                        <input type="hidden" name="status" value="Pending">
-                        <input type="hidden" name="slug" value="{{ restaurant['slug'] }}">
-                        <button type="submit" class="status-btn {{ 'active p' if (order['order_status'] or 'Pending') == 'Pending' else '' }}">Pending</button>
-                    </form>
-                    <form method="POST" action="/order/{{ order['id'] }}/status" style="display:inline;">
-                        <input type="hidden" name="status" value="Dispatched">
-                        <input type="hidden" name="slug" value="{{ restaurant['slug'] }}">
-                        <button type="submit" class="status-btn {{ 'active d' if order['order_status'] == 'Dispatched' else '' }}">Dispatched</button>
-                    </form>
-                    <form method="POST" action="/order/{{ order['id'] }}/status" style="display:inline;">
-                        <input type="hidden" name="status" value="Delivered">
-                        <input type="hidden" name="slug" value="{{ restaurant['slug'] }}">
-                        <button type="submit" class="status-btn {{ 'active v' if order['order_status'] == 'Delivered' else '' }}">Delivered</button>
-                    </form>
-                </div>
-            </div>
-            {% endfor %}
-        {% else %}
-            <div class="no-orders"><p>No orders yet!</p></div>
-        {% endif %}
-    </div>
-    <div class="section">
-        <h2>Daily Summary</h2>
-        {% if daily_list %}
-        <table>
-            <tr><th>Date</th><th>Orders</th><th>Total Collected</th></tr>
-            {% for d in daily_list %}
-            <tr>
-                <td>{{ d['date'] }}</td>
-                <td>{{ d['order_count'] }}</td>
-                <td>Rs{{ d['day_total'] }}</td>
-            </tr>
-            {% endfor %}
-        </table>
-        {% else %}
-            <div class="no-orders"><p>No orders yet!</p></div>
-        {% endif %}
-    </div>
-    <script>
-        const RESTAURANT_SLUG = "{{ restaurant['slug'] }}";
-        const RESTAURANT_NAME = "{{ restaurant['name'] }}";
-        const ALERTS_KEY = "alerts_enabled_" + RESTAURANT_SLUG;
-        const ACK_KEY = "acknowledged_orders_" + RESTAURANT_SLUG;
-        let lastKnownCount = {{ orders|length }};
-        let alertsEnabled = localStorage.getItem(ALERTS_KEY) === "1";
-        let alertLoopTimer = null;
-        const baseTitle = document.title;
-
-        function beep(times) {
-            try {
-                const ctx = new (window.AudioContext || window.webkitAudioContext)();
-                let t = ctx.currentTime;
-                for (let i = 0; i < times; i++) {
-                    const osc = ctx.createOscillator();
-                    const gain = ctx.createGain();
-                    osc.connect(gain);
-                    gain.connect(ctx.destination);
-                    osc.frequency.value = 880;
-                    gain.gain.setValueAtTime(0.35, t);
-                    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
-                    osc.start(t);
-                    osc.stop(t + 0.3);
-                    t += 0.4;
-                }
-            } catch (e) {
-                console.log("beep failed:", e);
-            }
-        }
-
-        function speakOrderReceived() {
-            try {
-                if ("speechSynthesis" in window) {
-                    window.speechSynthesis.cancel();  // don't stack up overlapping utterances
-                    const u1 = new SpeechSynthesisUtterance("Order received");
-                    const u2 = new SpeechSynthesisUtterance("Order received");
-                    window.speechSynthesis.speak(u1);
-                    window.speechSynthesis.speak(u2);
-                } else {
-                    beep(2);
-                }
-            } catch (e) {
-                console.log("speech failed:", e);
-                beep(2);
-            }
-        }
-
-        function getAcknowledgedSet() {
-            try {
-                return new Set(JSON.parse(localStorage.getItem(ACK_KEY) || "[]"));
-            } catch (e) {
-                return new Set();
-            }
-        }
-
-        function saveAcknowledgedSet(set) {
-            localStorage.setItem(ACK_KEY, JSON.stringify(Array.from(set)));
-        }
-
-        function acknowledgeOrder(orderId) {
-            const set = getAcknowledgedSet();
-            set.add(String(orderId));
-            saveAcknowledgedSet(set);
-            updateAlertLoop();
-        }
-
-        function updateAlertLoop() {
-            const acknowledged = getAcknowledgedSet();
-            const cards = document.querySelectorAll(".order-card");
-            let unacknowledgedCount = 0;
-            cards.forEach(card => {
-                const id = card.getAttribute("data-order-id");
-                const status = card.getAttribute("data-status");
-                const isNew = status === "Pending" && !acknowledged.has(id);
-                card.classList.toggle("order-unacknowledged", isNew);
-                if (isNew) unacknowledgedCount++;
-            });
-
-            if (unacknowledgedCount > 0 && alertsEnabled) {
-                document.title = `(${unacknowledgedCount}) New Order! - ` + baseTitle;
-                if (!alertLoopTimer) {
-                    speakOrderReceived();
-                    alertLoopTimer = setInterval(speakOrderReceived, 6000);
-                }
-            } else {
-                document.title = baseTitle;
-                if (alertLoopTimer) {
-                    clearInterval(alertLoopTimer);
-                    alertLoopTimer = null;
-                }
-                if ("speechSynthesis" in window) {
-                    window.speechSynthesis.cancel();
-                }
-            }
-        }
-
-        function enableAlerts() {
-            alertsEnabled = true;
-            localStorage.setItem(ALERTS_KEY, "1");
-            beep(1);  // one-time user-gesture unlock for audio/speech autoplay on this origin
-            if ("Notification" in window && Notification.permission === "default") {
-                Notification.requestPermission();
-            }
-            const btn = document.getElementById("enable-alerts-btn");
-            btn.textContent = "Alerts On";
-            btn.disabled = true;
-            updateAlertLoop();
-        }
-
-        function flashPage() {
-            document.body.classList.add("new-order-flash");
-            setTimeout(() => document.body.classList.remove("new-order-flash"), 4500);
-        }
-
-        async function pollForNewOrders() {
-            try {
-                const res = await fetch(`/api/orders/count/${RESTAURANT_SLUG}`);
-                if (!res.ok) return;
-                const data = await res.json();
-                if (typeof data.count === "number" && data.count > lastKnownCount) {
-                    lastKnownCount = data.count;
-                    flashPage();
-                    if ("Notification" in window && Notification.permission === "granted") {
-                        new Notification(`New order - ${RESTAURANT_NAME}`, {
-                            body: "A new order just came in. Open the dashboard to view it."
-                        });
-                    }
-                    // Reload to pull in the new order card, then updateAlertLoop() on load
-                    // picks it up as unacknowledged and starts the repeating alert.
-                    setTimeout(() => location.reload(), 2500);
-                }
-            } catch (e) {
-                console.log("order poll failed:", e);
-            }
-        }
-
-        if (alertsEnabled) {
-            const btn = document.getElementById("enable-alerts-btn");
-            btn.textContent = "Alerts On";
-            btn.disabled = true;
-        }
-        updateAlertLoop();
-        setInterval(pollForNewOrders, 8000);
-    </script>
-</body>
-</html>
-    """, orders=orders, daily_list=daily_list, today_orders=today_orders, pending_count=pending_count,
-         dispatched_count=dispatched_count, delivered_count=delivered_count, restaurant=restaurant)
 
 @app.route("/order/<int:order_id>/status", methods=["POST"])
 @require_dashboard_auth
@@ -1317,14 +1350,15 @@ def update_order_status(order_id):
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute("UPDATE orders SET order_status=? WHERE id=?", (new_status, order_id))
         conn.commit()
+    if request.form.get("ajax") == "1":
+        return ("", 204)
     return ("", 303, {"Location": f"/dashboard/{slug}"})
+
 
 @app.route("/api/orders/count/<slug>")
 @require_dashboard_auth
 def api_orders_count(slug):
-    """Lightweight polling endpoint the dashboard JS hits every few seconds
-    to detect new orders without a full page reload, so it can fire a sound/
-    notification/flash alert before actually reloading to show the order."""
+    """Kept for backward compatibility; the dashboard now uses /api/orders/list."""
     restaurant = SLUG_TO_RESTAURANT.get(slug)
     if not restaurant:
         return jsonify({"error": "unknown restaurant"}), 404
@@ -1334,6 +1368,18 @@ def api_orders_count(slug):
             (restaurant["phone_number_id"],),
         ).fetchone()[0]
     return jsonify({"count": count})
+
+
+@app.route("/api/orders/list/<slug>")
+@require_dashboard_auth
+def api_orders_list(slug):
+    """Full dashboard data as JSON so the page can refresh live without a
+    reload (keeping the audio alarm alive)."""
+    restaurant = SLUG_TO_RESTAURANT.get(slug)
+    if not restaurant:
+        return jsonify({"error": "unknown restaurant"}), 404
+    return jsonify(_dashboard_payload(restaurant))
+
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
@@ -1405,16 +1451,15 @@ def webhook():
     session = get_session(restaurant, phone)
     reply = ""
 
-    # Handle location
+    # Handle location - this is the final step. If there is a cart, placing the
+    # order happens right here (no extra "HAAN" confirmation needed).
     if latitude and longitude:
         session["location"] = f"https://maps.google.com/?q={latitude},{longitude}"
         if session["cart"]:
-            cart_text = format_cart(session["cart"])
-            session["last_order"] = cart_text
-            reply = f"Location mil gayi!\n\n{cart_text}\n\nConfirm karna hai? HAAN likhein"
+            reply = finalize_order(restaurant, session, phone)
         else:
-            reply = "Location mil gayi!\n\nOrder confirm karna hai? HAAN likhein"
-        session["stage"] = "confirming"
+            reply = "Location mil gayi! Ab apna order bataiye - item ka naam likhein, ya MENU likhein."
+            session["stage"] = "welcome"
 
     else:
         stripped_msg = incoming_msg.strip()
@@ -1434,7 +1479,7 @@ def webhook():
             if cat and 1 <= item_num <= len(items_list):
                 item_name, item_price = items_list[item_num - 1]
                 session["cart"].append({"name": item_name, "price": item_price, "qty": qty})
-                reply = f"{item_name} x{qty} cart mein add!\n\nAur add karna hai? Item number ya naam likhein.\nCART - cart dekhein\n0 - wapas menu pe"
+                reply = f"{item_name} x{qty} cart mein add!\n\nAur add karna hai? Item number ya naam likhein.\nHo gaya toh DONE likhein.\nCART - cart dekhein | 0 - wapas menu pe"
             else:
                 reply = f"Invalid number! 1 se {len(items_list)} ke beech likhein, ya item ka naam bhi likh sakte hain."
 
@@ -1462,7 +1507,7 @@ def webhook():
                 intent = parsed.get("intent", "unknown")
                 print(f"[{restaurant['name']}] Stage: {session['stage']}, LLM intent: {intent}")
 
-                if intent == "greeting" or session["stage"] == "new":
+                if intent == "greeting" or (session["stage"] == "new" and intent == "unknown"):
                     reply = restaurant["greeting_text"]
                     session["stage"] = "welcome"
 
@@ -1499,12 +1544,19 @@ def webhook():
                     reply = render_cart_reply(session)
 
                 elif intent == "confirm":
-                    if session["stage"] == "confirming":
-                        reply = finalize_order(restaurant, session, phone)
-                    elif session["cart"]:
-                        reply = f"{format_cart(session['cart'])}\n\nOrder confirm karne ke liye pehle apni location share karein!\nWhatsApp mein attachment > Location > Send location"
-                    else:
+                    if not session["cart"]:
                         reply = "Cart abhi empty hai! Pehle kuch order karein - item ka naam likhein."
+                    elif session.get("location"):
+                        # location already shared earlier - place it now
+                        reply = finalize_order(restaurant, session, phone)
+                    else:
+                        session["stage"] = "awaiting_location"
+                        reply = (
+                            f"{format_cart(session['cart'])}\n\n"
+                            "Order pakka! Ab bas apni LOCATION bhejein - WhatsApp mein "
+                            "clip/attachment > Location > Send your current location.\n"
+                            "Location milte hi order place ho jayega."
+                        )
 
                 elif intent == "cancel":
                     reply = "Koi baat nahi! Cart clear kar diya. MENU likhein dobara order karne ke liye."
