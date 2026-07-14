@@ -1,0 +1,14 @@
+name: Keep Render bot awake
+
+on:
+  schedule:
+    # every 10 minutes, so the free-tier instance never hits Render's ~15 min spin-down window
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping bot
+        run: curl -sf --max-time 30 https://whatsapp-bot-1-yebe.onrender.com/privacy || echo "ping failed (cold start in progress, ignoring)"
