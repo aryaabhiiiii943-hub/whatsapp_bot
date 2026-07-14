@@ -5,6 +5,7 @@ from flask import Flask, request, render_template_string
 from groq import Groq
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from functools import wraps
 import os
 import re
 import json
@@ -46,6 +47,30 @@ if missing:
 
 if not DEMO_PHONE_NUMBER_ID:
     print("WARNING: DEMO_PHONE_NUMBER_ID not set - restaurant #2 (demo) is disabled, only Tandoori Junction will respond.")
+
+# --- Dashboard login (shared by both restaurants' dashboards). If these
+# aren't set, the dashboard stays open with no login prompt - fine for local
+# dev, but should always be set before a real demo since /dashboard shows
+# customer phone numbers and delivery locations. ---
+DASHBOARD_USERNAME = os.environ.get("DASHBOARD_USERNAME")
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD")
+
+def require_dashboard_auth(view):
+    """HTTP Basic Auth gate for the order dashboards. Triggers the browser's
+    built-in login prompt - no custom login page needed."""
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not DASHBOARD_USERNAME or not DASHBOARD_PASSWORD:
+            return view(*args, **kwargs)
+        auth = request.authorization
+        if not auth or auth.username != DASHBOARD_USERNAME or auth.password != DASHBOARD_PASSWORD:
+            return (
+                "Login required",
+                401,
+                {"WWW-Authenticate": 'Basic realm="Restaurant Dashboard"'},
+            )
+        return view(*args, **kwargs)
+    return wrapped
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
@@ -480,6 +505,7 @@ RESTAURANTS = {
         "access_token": META_ACCESS_TOKEN,
         "owner_number": OWNER_NUMBER,
         "name": "Tandoori Junction",
+        "slug": "tandoori",
         "categories": CATEGORIES,
         "item_lookup": ITEM_LOOKUP,
         "menu_reference_text": MENU_REFERENCE_TEXT,
@@ -495,6 +521,7 @@ if DEMO_PHONE_NUMBER_ID:
         "access_token": DEMO_ACCESS_TOKEN,
         "owner_number": DEMO_OWNER_NUMBER,
         "name": DEMO_RESTAURANT_NAME,
+        "slug": "demo",
         "categories": DEMO_CATEGORIES,
         "item_lookup": DEMO_ITEM_LOOKUP,
         "menu_reference_text": DEMO_MENU_REFERENCE_TEXT,
@@ -502,6 +529,10 @@ if DEMO_PHONE_NUMBER_ID:
         "greeting_text": DEMO_GREETING_TEXT,
         "faq_text": DEMO_FAQ_TEXT,
     }
+
+# Lets /dashboard/<slug> look up a restaurant by its short URL name instead
+# of its raw Meta phone_number_id.
+SLUG_TO_RESTAURANT = {r["slug"]: r for r in RESTAURANTS.values()}
 
 app = Flask(__name__)
 # Sessions are now keyed by (restaurant phone_number_id, customer phone) so
@@ -831,19 +862,25 @@ def legacy_intent_reply(restaurant, session, phone, incoming_msg, intent):
     return "Abhi thoda dikkat ho rahi hai samajhne mein. MENU likhein ya item ka number/naam likhein."
 
 @app.route("/dashboard")
-def dashboard():
+@app.route("/dashboard/<slug>")
+@require_dashboard_auth
+def dashboard(slug="tandoori"):
+    restaurant = SLUG_TO_RESTAURANT.get(slug)
+    if not restaurant:
+        return f"Unknown restaurant '{slug}'. Valid options: {', '.join(SLUG_TO_RESTAURANT.keys())}", 404
+
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
-        orders = conn.execute("SELECT * FROM orders ORDER BY id DESC").fetchall()
+        orders = conn.execute(
+            "SELECT * FROM orders WHERE restaurant_id=? ORDER BY id DESC",
+            (restaurant["phone_number_id"],),
+        ).fetchall()
 
     def parse_total(t):
         try:
             return int(str(t).replace("Rs", "").strip())
         except (TypeError, ValueError):
             return 0
-
-    def restaurant_name(rid):
-        return RESTAURANTS.get(rid, {}).get("name", "Unknown restaurant")
 
     # Every order is its own independent, individually-billed record - a customer
     # ordering twice in one day produces two separate rows with two separate totals,
@@ -867,7 +904,7 @@ def dashboard():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Restaurant Orders Dashboard</title>
+    <title>{{ restaurant['name'] }} Dashboard</title>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
@@ -911,8 +948,8 @@ def dashboard():
 </head>
 <body>
     <div class="header">
-        <h1>Restaurant Orders Dashboard</h1>
-        <p>Order Management - all restaurants on this deployment</p>
+        <h1>{{ restaurant['name'] }} Dashboard</h1>
+        <p>Order Management</p>
     </div>
     <div class="stats">
         <div class="stat-card"><h2>{{ orders|length }}</h2><p>Total Orders</p></div>
@@ -929,7 +966,6 @@ def dashboard():
         {% if orders %}
             {% for order in orders %}
             <div class="order-card">
-                <div class="order-restaurant">{{ restaurant_name(order['restaurant_id']) }}</div>
                 <div class="order-header">
                     <span class="order-id">Order #{{ order['id'] }}</span>
                     <span class="order-time">{{ order['timestamp'] }}</span>
@@ -949,14 +985,17 @@ def dashboard():
                 <div class="status-btns">
                     <form method="POST" action="/order/{{ order['id'] }}/status" style="display:inline;">
                         <input type="hidden" name="status" value="Pending">
+                        <input type="hidden" name="slug" value="{{ restaurant['slug'] }}">
                         <button type="submit" class="status-btn {{ 'active p' if (order['order_status'] or 'Pending') == 'Pending' else '' }}">Pending</button>
                     </form>
                     <form method="POST" action="/order/{{ order['id'] }}/status" style="display:inline;">
                         <input type="hidden" name="status" value="Dispatched">
+                        <input type="hidden" name="slug" value="{{ restaurant['slug'] }}">
                         <button type="submit" class="status-btn {{ 'active d' if order['order_status'] == 'Dispatched' else '' }}">Dispatched</button>
                     </form>
                     <form method="POST" action="/order/{{ order['id'] }}/status" style="display:inline;">
                         <input type="hidden" name="status" value="Delivered">
+                        <input type="hidden" name="slug" value="{{ restaurant['slug'] }}">
                         <button type="submit" class="status-btn {{ 'active v' if order['order_status'] == 'Delivered' else '' }}">Delivered</button>
                     </form>
                 </div>
@@ -987,17 +1026,21 @@ def dashboard():
 </body>
 </html>
     """, orders=orders, daily_list=daily_list, today_orders=today_orders, pending_count=pending_count,
-         dispatched_count=dispatched_count, delivered_count=delivered_count, restaurant_name=restaurant_name)
+         dispatched_count=dispatched_count, delivered_count=delivered_count, restaurant=restaurant)
 
 @app.route("/order/<int:order_id>/status", methods=["POST"])
+@require_dashboard_auth
 def update_order_status(order_id):
     new_status = request.form.get("status", "Pending")
     if new_status not in ("Pending", "Dispatched", "Delivered"):
         new_status = "Pending"
+    slug = request.form.get("slug", "tandoori")
+    if slug not in SLUG_TO_RESTAURANT:
+        slug = "tandoori"
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute("UPDATE orders SET order_status=? WHERE id=?", (new_status, order_id))
         conn.commit()
-    return ("", 303, {"Location": "/dashboard"})
+    return ("", 303, {"Location": f"/dashboard/{slug}"})
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
