@@ -1,7 +1,7 @@
 import sys
 sys.stdout.reconfigure(encoding='utf-8')
 
-from flask import Flask, request, render_template_string
+from flask import Flask, request, render_template_string, jsonify
 from groq import Groq
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -950,12 +950,20 @@ def dashboard(slug="tandoori"):
         table { width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
         th, td { text-align: left; padding: 12px 15px; font-size: 13px; border-bottom: 1px solid #eee; }
         th { background: #fafafa; color: #666; }
+        .alerts-btn { background: white; color: #e74c3c; border: none; padding: 8px 16px; border-radius: 20px; font-size: 13px; font-weight: bold; cursor: pointer; margin-top: 10px; }
+        .alerts-btn:disabled { background: #ffe5e2; cursor: default; }
+        @keyframes newOrderPulse {
+            0%, 100% { box-shadow: inset 0 0 0 0 rgba(231,76,60,0); }
+            50% { box-shadow: inset 0 0 60px 15px rgba(231,76,60,0.55); }
+        }
+        body.new-order-flash { animation: newOrderPulse 0.7s ease-in-out 6; }
     </style>
 </head>
 <body>
     <div class="header">
         <h1>{{ restaurant['name'] }} Dashboard</h1>
         <p>Order Management</p>
+        <button id="enable-alerts-btn" class="alerts-btn" onclick="enableAlerts()">Enable Order Alerts</button>
     </div>
     <div class="stats">
         <div class="stat-card"><h2>{{ orders|length }}</h2><p>Total Orders</p></div>
@@ -1028,7 +1036,76 @@ def dashboard(slug="tandoori"):
             <div class="no-orders"><p>No orders yet!</p></div>
         {% endif %}
     </div>
-    <script>setTimeout(() => location.reload(), 30000);</script>
+    <script>
+        const RESTAURANT_SLUG = "{{ restaurant['slug'] }}";
+        const RESTAURANT_NAME = "{{ restaurant['name'] }}";
+        let lastKnownCount = {{ orders|length }};
+        let alertsEnabled = false;
+        const baseTitle = document.title;
+
+        function beep(times) {
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                let t = ctx.currentTime;
+                for (let i = 0; i < times; i++) {
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.frequency.value = 880;
+                    gain.gain.setValueAtTime(0.35, t);
+                    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+                    osc.start(t);
+                    osc.stop(t + 0.3);
+                    t += 0.4;
+                }
+            } catch (e) {
+                console.log("beep failed:", e);
+            }
+        }
+
+        function enableAlerts() {
+            alertsEnabled = true;
+            beep(1);
+            if ("Notification" in window && Notification.permission === "default") {
+                Notification.requestPermission();
+            }
+            const btn = document.getElementById("enable-alerts-btn");
+            btn.textContent = "Alerts On";
+            btn.disabled = true;
+        }
+
+        function flashPage() {
+            document.body.classList.add("new-order-flash");
+            setTimeout(() => document.body.classList.remove("new-order-flash"), 4500);
+        }
+
+        async function pollForNewOrders() {
+            try {
+                const res = await fetch(`/api/orders/count/${RESTAURANT_SLUG}`);
+                if (!res.ok) return;
+                const data = await res.json();
+                if (typeof data.count === "number" && data.count > lastKnownCount) {
+                    lastKnownCount = data.count;
+                    flashPage();
+                    if (alertsEnabled) {
+                        beep(4);
+                    }
+                    if ("Notification" in window && Notification.permission === "granted") {
+                        new Notification(`New order - ${RESTAURANT_NAME}`, {
+                            body: "A new order just came in. Open the dashboard to view it."
+                        });
+                    }
+                    document.title = "New Order! - " + baseTitle;
+                    setTimeout(() => location.reload(), 2500);
+                }
+            } catch (e) {
+                console.log("order poll failed:", e);
+            }
+        }
+
+        setInterval(pollForNewOrders, 8000);
+    </script>
 </body>
 </html>
     """, orders=orders, daily_list=daily_list, today_orders=today_orders, pending_count=pending_count,
@@ -1047,6 +1124,22 @@ def update_order_status(order_id):
         conn.execute("UPDATE orders SET order_status=? WHERE id=?", (new_status, order_id))
         conn.commit()
     return ("", 303, {"Location": f"/dashboard/{slug}"})
+
+@app.route("/api/orders/count/<slug>")
+@require_dashboard_auth
+def api_orders_count(slug):
+    """Lightweight polling endpoint the dashboard JS hits every few seconds
+    to detect new orders without a full page reload, so it can fire a sound/
+    notification/flash alert before actually reloading to show the order."""
+    restaurant = SLUG_TO_RESTAURANT.get(slug)
+    if not restaurant:
+        return jsonify({"error": "unknown restaurant"}), 404
+    with sqlite3.connect(DB_FILE) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE restaurant_id=?",
+            (restaurant["phone_number_id"],),
+        ).fetchone()[0]
+    return jsonify({"count": count})
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
