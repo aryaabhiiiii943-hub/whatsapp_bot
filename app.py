@@ -957,6 +957,13 @@ def dashboard(slug="tandoori"):
             50% { box-shadow: inset 0 0 60px 15px rgba(231,76,60,0.55); }
         }
         body.new-order-flash { animation: newOrderPulse 0.7s ease-in-out 6; }
+        .ack-btn { display: block; width: 100%; margin-top: 10px; background: #e74c3c; color: white; border: none; padding: 10px; border-radius: 6px; font-size: 13px; font-weight: bold; cursor: pointer; }
+        .order-card.order-unacknowledged { border-left-color: #ff0000; animation: cardPulse 1s ease-in-out infinite; }
+        @keyframes cardPulse {
+            0%, 100% { box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+            50% { box-shadow: 0 0 0 4px rgba(231,76,60,0.5); }
+        }
+        .order-card:not(.order-unacknowledged) .ack-btn { display: none; }
     </style>
 </head>
 <body>
@@ -979,7 +986,7 @@ def dashboard(slug="tandoori"):
         <div style="clear:both"></div>
         {% if orders %}
             {% for order in orders %}
-            <div class="order-card">
+            <div class="order-card" data-order-id="{{ order['id'] }}" data-status="{{ order['order_status'] or 'Pending' }}">
                 <div class="order-header">
                     <span class="order-id">Order #{{ order['id'] }}</span>
                     <span class="order-time">{{ order['timestamp'] }}</span>
@@ -995,6 +1002,9 @@ def dashboard(slug="tandoori"):
                 </div>
                 {% if order['alert_status'] and order['alert_status'] not in ('delivered', 'read') %}
                 <div class="alert-hint">Owner alert not yet confirmed delivered ({{ order['alert_status'] }}, {{ order['alert_retries'] }} retries) - auto-retrying.</div>
+                {% endif %}
+                {% if (order['order_status'] or 'Pending') == 'Pending' %}
+                <button class="ack-btn" onclick="acknowledgeOrder('{{ order['id'] }}')">New Order - Click to Acknowledge</button>
                 {% endif %}
                 <div class="status-btns">
                     <form method="POST" action="/order/{{ order['id'] }}/status" style="display:inline;">
@@ -1039,8 +1049,11 @@ def dashboard(slug="tandoori"):
     <script>
         const RESTAURANT_SLUG = "{{ restaurant['slug'] }}";
         const RESTAURANT_NAME = "{{ restaurant['name'] }}";
+        const ALERTS_KEY = "alerts_enabled_" + RESTAURANT_SLUG;
+        const ACK_KEY = "acknowledged_orders_" + RESTAURANT_SLUG;
         let lastKnownCount = {{ orders|length }};
-        let alertsEnabled = false;
+        let alertsEnabled = localStorage.getItem(ALERTS_KEY) === "1";
+        let alertLoopTimer = null;
         const baseTitle = document.title;
 
         function beep(times) {
@@ -1064,15 +1077,83 @@ def dashboard(slug="tandoori"):
             }
         }
 
+        function speakOrderReceived() {
+            try {
+                if ("speechSynthesis" in window) {
+                    window.speechSynthesis.cancel();  // don't stack up overlapping utterances
+                    const u1 = new SpeechSynthesisUtterance("Order received");
+                    const u2 = new SpeechSynthesisUtterance("Order received");
+                    window.speechSynthesis.speak(u1);
+                    window.speechSynthesis.speak(u2);
+                } else {
+                    beep(2);
+                }
+            } catch (e) {
+                console.log("speech failed:", e);
+                beep(2);
+            }
+        }
+
+        function getAcknowledgedSet() {
+            try {
+                return new Set(JSON.parse(localStorage.getItem(ACK_KEY) || "[]"));
+            } catch (e) {
+                return new Set();
+            }
+        }
+
+        function saveAcknowledgedSet(set) {
+            localStorage.setItem(ACK_KEY, JSON.stringify(Array.from(set)));
+        }
+
+        function acknowledgeOrder(orderId) {
+            const set = getAcknowledgedSet();
+            set.add(String(orderId));
+            saveAcknowledgedSet(set);
+            updateAlertLoop();
+        }
+
+        function updateAlertLoop() {
+            const acknowledged = getAcknowledgedSet();
+            const cards = document.querySelectorAll(".order-card");
+            let unacknowledgedCount = 0;
+            cards.forEach(card => {
+                const id = card.getAttribute("data-order-id");
+                const status = card.getAttribute("data-status");
+                const isNew = status === "Pending" && !acknowledged.has(id);
+                card.classList.toggle("order-unacknowledged", isNew);
+                if (isNew) unacknowledgedCount++;
+            });
+
+            if (unacknowledgedCount > 0 && alertsEnabled) {
+                document.title = `(${unacknowledgedCount}) New Order! - ` + baseTitle;
+                if (!alertLoopTimer) {
+                    speakOrderReceived();
+                    alertLoopTimer = setInterval(speakOrderReceived, 6000);
+                }
+            } else {
+                document.title = baseTitle;
+                if (alertLoopTimer) {
+                    clearInterval(alertLoopTimer);
+                    alertLoopTimer = null;
+                }
+                if ("speechSynthesis" in window) {
+                    window.speechSynthesis.cancel();
+                }
+            }
+        }
+
         function enableAlerts() {
             alertsEnabled = true;
-            beep(1);
+            localStorage.setItem(ALERTS_KEY, "1");
+            beep(1);  // one-time user-gesture unlock for audio/speech autoplay on this origin
             if ("Notification" in window && Notification.permission === "default") {
                 Notification.requestPermission();
             }
             const btn = document.getElementById("enable-alerts-btn");
             btn.textContent = "Alerts On";
             btn.disabled = true;
+            updateAlertLoop();
         }
 
         function flashPage() {
@@ -1088,15 +1169,13 @@ def dashboard(slug="tandoori"):
                 if (typeof data.count === "number" && data.count > lastKnownCount) {
                     lastKnownCount = data.count;
                     flashPage();
-                    if (alertsEnabled) {
-                        beep(4);
-                    }
                     if ("Notification" in window && Notification.permission === "granted") {
                         new Notification(`New order - ${RESTAURANT_NAME}`, {
                             body: "A new order just came in. Open the dashboard to view it."
                         });
                     }
-                    document.title = "New Order! - " + baseTitle;
+                    // Reload to pull in the new order card, then updateAlertLoop() on load
+                    // picks it up as unacknowledged and starts the repeating alert.
                     setTimeout(() => location.reload(), 2500);
                 }
             } catch (e) {
@@ -1104,6 +1183,12 @@ def dashboard(slug="tandoori"):
             }
         }
 
+        if (alertsEnabled) {
+            const btn = document.getElementById("enable-alerts-btn");
+            btn.textContent = "Alerts On";
+            btn.disabled = true;
+        }
+        updateAlertLoop();
         setInterval(pollForNewOrders, 8000);
     </script>
 </body>
