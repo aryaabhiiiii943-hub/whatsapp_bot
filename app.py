@@ -34,7 +34,7 @@ OWNER_NUMBER = os.environ.get("OWNER_WHATSAPP_NUMBER", "918935842629")  # not a 
 DEMO_PHONE_NUMBER_ID = os.environ.get("DEMO_PHONE_NUMBER_ID")
 DEMO_ACCESS_TOKEN = os.environ.get("DEMO_ACCESS_TOKEN") or META_ACCESS_TOKEN
 DEMO_OWNER_NUMBER = os.environ.get("DEMO_OWNER_WHATSAPP_NUMBER", OWNER_NUMBER)
-DEMO_RESTAURANT_NAME = os.environ.get("DEMO_RESTAURANT_NAME", "Aryanisation Demo Kitchen")
+DEMO_RESTAURANT_NAME = os.environ.get("DEMO_RESTAURANT_NAME", "Rollicious")
 
 required_env_vars = {
     "GROQ_API_KEY": GROQ_API_KEY,
@@ -153,15 +153,26 @@ def send_meta_message(restaurant, to_phone, text):
         return None
 
 def build_order_alert_text(restaurant, row, is_reminder=False):
-    header = f"REMINDER - Order Not Yet Confirmed Seen!" if is_reminder else f"NEW ORDER - {restaurant['name']}"
+    """Owner/outlet-facing alert. Optimised for a shopkeeper glancing at their
+    phone: order number + items to cook first, total in bold, then who/where
+    to deliver. Uses WhatsApp *bold* markers for the bits that matter most."""
+    loc = row["location"]
+    if loc and loc != "Not shared":
+        loc_line = f"Location: {loc}"
+    else:
+        loc_line = "Location: NOT SHARED - call customer for address"
+
+    header = "*REMINDER - order not yet confirmed*" if is_reminder else "*NEW ORDER*"
     return (
-        f"{header}\n\n"
+        f"{header}  #{row['id']} - {restaurant['name']}\n"
+        f"{row['timestamp']}\n"
+        f"--------------------------------\n"
+        f"{row['order_text']}\n"
+        f"--------------------------------\n"
+        f"*TOTAL: {row['total']}*\n\n"
         f"Customer: {row['phone']}\n"
-        f"Order:\n{row['order_text']}\n"
-        f"Total: {row['total']}\n"
-        f"Location: {row['location'] or 'Not shared'}\n"
-        f"Time: {row['timestamp']}\n\n"
-        f"Call customer to confirm delivery!"
+        f"{loc_line}\n\n"
+        f"Call the customer to confirm, then start prep."
     )
 
 def resend_pending_alerts():
@@ -377,47 +388,110 @@ CATEGORIES = {
 # ============================================================
 DEMO_CATEGORIES = {
     "1": {
-        "name": "Pizza",
-        "display": """1. Margherita Pizza - Rs299
-2. Paneer Tikka Pizza - Rs379
-3. Chicken BBQ Pizza - Rs429""",
+        "name": "Chicken & Egg Rolls",
+        "display": """1. Chicken Tikka Roll - Rs89
+2. Chicken Tikka Roll + Egg - Rs99
+3. Chicken Tikka Roll + Double Egg - Rs109
+4. Buna Chicken Roll - Rs79
+5. Buna Chicken Roll + Egg - Rs89
+6. Buna Chicken Roll + Double Egg - Rs99
+7. Chicken Malai Kabab Roll - Rs89
+8. Chicken Malai Kabab Roll + Egg - Rs99
+9. Chicken Malai Kabab Roll + Double Egg - Rs109
+10. Chicken Haryali Kabab Roll - Rs89
+11. Chicken Haryali Kabab Roll + Egg - Rs99
+12. Chicken Haryali Kabab Roll + Double Egg - Rs109
+13. Chicken Chilly Roll - Rs89
+14. Chicken Chilly Roll + Egg - Rs99
+15. Chicken Chilly Roll + Double Egg - Rs109
+16. Double Buna Chicken Roll - Rs99
+17. Double Buna Chicken Roll + Egg - Rs109
+18. Double Buna Chicken Roll + Double Egg - Rs119
+19. Egg Crust Roll - Rs59
+20. Double Egg Crust Roll - Rs69""",
         "items_list": [
-            ("Margherita Pizza", 299),
-            ("Paneer Tikka Pizza", 379),
-            ("Chicken BBQ Pizza", 429),
+            ("Chicken Tikka Roll", 89),
+            ("Chicken Tikka Roll + Egg", 99),
+            ("Chicken Tikka Roll + Double Egg", 109),
+            ("Buna Chicken Roll", 79),
+            ("Buna Chicken Roll + Egg", 89),
+            ("Buna Chicken Roll + Double Egg", 99),
+            ("Chicken Malai Kabab Roll", 89),
+            ("Chicken Malai Kabab Roll + Egg", 99),
+            ("Chicken Malai Kabab Roll + Double Egg", 109),
+            ("Chicken Haryali Kabab Roll", 89),
+            ("Chicken Haryali Kabab Roll + Egg", 99),
+            ("Chicken Haryali Kabab Roll + Double Egg", 109),
+            ("Chicken Chilly Roll", 89),
+            ("Chicken Chilly Roll + Egg", 99),
+            ("Chicken Chilly Roll + Double Egg", 109),
+            ("Double Buna Chicken Roll", 99),
+            ("Double Buna Chicken Roll + Egg", 109),
+            ("Double Buna Chicken Roll + Double Egg", 119),
+            ("Egg Crust Roll", 59),
+            ("Double Egg Crust Roll", 69),
         ]
     },
     "2": {
-        "name": "Burgers",
-        "display": """1. Veg Crunch Burger - Rs149
-2. Chicken Classic Burger - Rs199
-3. Double Cheese Burger - Rs229""",
+        "name": "Veg Rolls",
+        "display": """1. Paneer Tikka Roll - Rs89
+2. Paneer Tikka Roll + Egg - Rs99
+3. Paneer Tikka Roll + Double Egg - Rs109
+4. Paneer Chilly Roll - Rs99
+5. Paneer Chilly Roll + Egg - Rs109
+6. Paneer Chilly Roll + Double Egg - Rs119
+7. Paneer Mushroom Fusion Roll - Rs99
+8. Paneer Mushroom Fusion Roll + Egg - Rs109
+9. Paneer Mushroom Fusion Roll + Double Egg - Rs119
+10. Aloo Chilly Roll - Rs79
+11. Aloo Chilly Roll + Egg - Rs89
+12. Aloo Chilly Roll + Double Egg - Rs109
+13. Mushroom Chilly Roll - Rs79
+14. Mushroom Chilly Roll + Egg - Rs89
+15. Mushroom Chilly Roll + Double Egg - Rs99
+16. Veg Delight Roll - Rs69
+17. Veg Delight Roll + Egg - Rs79
+18. Veg Delight Roll + Double Egg - Rs89""",
         "items_list": [
-            ("Veg Crunch Burger", 149),
-            ("Chicken Classic Burger", 199),
-            ("Double Cheese Burger", 229),
+            ("Paneer Tikka Roll", 89),
+            ("Paneer Tikka Roll + Egg", 99),
+            ("Paneer Tikka Roll + Double Egg", 109),
+            ("Paneer Chilly Roll", 99),
+            ("Paneer Chilly Roll + Egg", 109),
+            ("Paneer Chilly Roll + Double Egg", 119),
+            ("Paneer Mushroom Fusion Roll", 99),
+            ("Paneer Mushroom Fusion Roll + Egg", 109),
+            ("Paneer Mushroom Fusion Roll + Double Egg", 119),
+            ("Aloo Chilly Roll", 79),
+            ("Aloo Chilly Roll + Egg", 89),
+            ("Aloo Chilly Roll + Double Egg", 109),
+            ("Mushroom Chilly Roll", 79),
+            ("Mushroom Chilly Roll + Egg", 89),
+            ("Mushroom Chilly Roll + Double Egg", 99),
+            ("Veg Delight Roll", 69),
+            ("Veg Delight Roll + Egg", 79),
+            ("Veg Delight Roll + Double Egg", 89),
         ]
     },
     "3": {
-        "name": "Beverages",
-        "display": """1. Cold Coffee - Rs129
-2. Fresh Lime Soda - Rs89
-3. Masala Chai - Rs49""",
+        "name": "Bahubali Rolls (Giant)",
+        "display": """Ek Mein Do Ka Maza!
+1. Triple Delight Bahubali Chicken - Rs170
+2. Veg Fusion Bahubali - Rs150""",
         "items_list": [
-            ("Cold Coffee", 129),
-            ("Fresh Lime Soda", 89),
-            ("Masala Chai", 49),
+            ("Triple Delight Bahubali Chicken", 170),
+            ("Veg Fusion Bahubali", 150),
         ]
     },
     "4": {
-        "name": "Desserts",
-        "display": """1. Chocolate Brownie - Rs159
-2. Gulab Jamun (2 pc) - Rs99""",
+        "name": "Add-ons",
+        "display": """1. Laccha Paratha - Rs25
+2. Extra Cheese / Mayonnaise - Rs10""",
         "items_list": [
-            ("Chocolate Brownie", 159),
-            ("Gulab Jamun (2 pc)", 99),
+            ("Laccha Paratha", 25),
+            ("Extra Cheese / Mayonnaise", 10),
         ]
-    },
+    }
 }
 
 def _build_item_lookup(categories):
@@ -483,16 +557,36 @@ Timings: 10 AM - 10 PM
 Phone: 9523087860
 Home Delivery available"""
 
-# Demo restaurant's texts - built generically from DEMO_CATEGORIES.
+# Rollicious texts. Lookup + LLM menu reference are still derived from
+# DEMO_CATEGORIES; the customer-facing copy is Rollicious-branded.
 DEMO_ITEM_LOOKUP = _build_item_lookup(DEMO_CATEGORIES)
 DEMO_MENU_REFERENCE_TEXT = _build_menu_reference(DEMO_CATEGORIES)
-DEMO_CATEGORY_MENU = _build_category_menu(DEMO_RESTAURANT_NAME, DEMO_CATEGORIES)
-DEMO_GREETING_TEXT = _build_greeting(DEMO_RESTAURANT_NAME)
-DEMO_FAQ_TEXT = f"""{DEMO_RESTAURANT_NAME}
-This is a live demo of the Aryanisation WhatsApp ordering platform.
+DEMO_CATEGORY_MENU = """Rollicious Menu
+The Roll Company - Ek Mein Do Ka Maza
 
-Timings: Always open (demo)
-Home Delivery available"""
+Konsi category chahiye?
+
+1 - Chicken & Egg Rolls
+2 - Veg Rolls
+3 - Bahubali Rolls (Giant)
+4 - Add-ons
+
+Number bhejo!"""
+DEMO_GREETING_TEXT = """Rollicious mein aapka swagat hai!
+The Roll Company - Ek Mein Do Ka Maza
+
+Main aapki order lene ke liye yahan hoon!
+
+MENU likhein poora menu dekhne ke liye
+Ya seedha order karein - jaise 'chicken tikka roll' ya '2 paneer tikka roll'!"""
+DEMO_FAQ_TEXT = """Rollicious - The Roll Company
+
+Order/Call: 9124890708
+Free Home Delivery
+Zomato & Swiggy pe bhi available
+Instagram: @rollicious_07
+
+Note: Payment advance/online hai - no credit."""
 
 # ============================================================
 # Restaurant registry - keyed by phone_number_id, which is exactly what
@@ -521,7 +615,7 @@ if DEMO_PHONE_NUMBER_ID:
         "access_token": DEMO_ACCESS_TOKEN,
         "owner_number": DEMO_OWNER_NUMBER,
         "name": DEMO_RESTAURANT_NAME,
-        "slug": "demo",
+        "slug": "rollicious",
         "categories": DEMO_CATEGORIES,
         "item_lookup": DEMO_ITEM_LOOKUP,
         "menu_reference_text": DEMO_MENU_REFERENCE_TEXT,
@@ -626,6 +720,17 @@ def format_cart(cart):
         total += subtotal
         lines.append(f"- {item['name']} x{item['qty']} = Rs{subtotal}")
     lines.append(f"TOTAL: Rs{total}")
+    return "\n".join(lines)
+
+def format_order_for_record(cart):
+    """Compact, quantity-first itemisation stored with the order and shown to
+    the owner (in the alert) and on the dashboard - clearer to read while
+    packing than the customer-facing cart layout."""
+    if not cart:
+        return "(empty)"
+    lines = []
+    for item in cart:
+        lines.append(f"{item['qty']} x {item['name']}  =  Rs{item['price'] * item['qty']}")
     return "\n".join(lines)
 
 ORDER_PARSE_SCHEMA = {
@@ -783,7 +888,7 @@ def finalize_order(restaurant, session, phone):
     if not session["cart"]:
         return "Cart abhi empty hai! Pehle kuch order karein - item ka naam likhein."
 
-    order_text = format_cart(session["cart"])
+    order_text = format_order_for_record(session["cart"])
     total_num = sum(item["price"] * item["qty"] for item in session["cart"])
     total = f"Rs{total_num}"
 
@@ -939,6 +1044,8 @@ def dashboard(slug="tandoori"):
         .status-delivered { background: #d4edda; color: #155724; }
         .alert-hint { font-size: 11px; color: #999; margin-top: 4px; }
         .location { color: #3498db; font-size: 13px; text-decoration: none; }
+        .no-loc { color: #e74c3c; font-size: 13px; font-weight: bold; }
+        .order-phone a { color: #2c3e50; text-decoration: none; font-weight: bold; }
         .no-orders { text-align: center; padding: 50px; color: #999; }
         .refresh-btn { background: #e74c3c; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; margin-bottom: 15px; float: right; }
         .status-btns { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
@@ -991,13 +1098,15 @@ def dashboard(slug="tandoori"):
                     <span class="order-id">Order #{{ order['id'] }}</span>
                     <span class="order-time">{{ order['timestamp'] }}</span>
                 </div>
-                <div class="order-phone">Phone: {{ order['phone'] }}</div>
+                <div class="order-phone">Phone: <a href="tel:+{{ order['phone'] }}">+{{ order['phone'] }}</a> &nbsp;|&nbsp; <a href="https://wa.me/{{ order['phone'] }}" target="_blank">WhatsApp</a></div>
                 <div class="order-text">{{ order['order_text'] }}</div>
                 <div class="order-footer">
                     <span class="total">{{ order['total'] }}</span>
                     <span class="status status-{{ (order['order_status'] or 'Pending')|lower }}">{{ order['order_status'] or 'Pending' }}</span>
                     {% if order['location'] and order['location'] != 'Not shared' %}
                     <a class="location" href="{{ order['location'] }}" target="_blank">View Location</a>
+                    {% else %}
+                    <span class="no-loc">Location not shared - call customer</span>
                     {% endif %}
                 </div>
                 {% if order['alert_status'] and order['alert_status'] not in ('delivered', 'read') %}
