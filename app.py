@@ -480,8 +480,6 @@ RESTAURANTS = {
         "access_token": META_ACCESS_TOKEN,
         "owner_number": OWNER_NUMBER,
         "name": "Tandoori Junction",
-        # Used for this restaurant's own dashboard URL: /dashboard/tandoori
-        "slug": "tandoori",
         "categories": CATEGORIES,
         "item_lookup": ITEM_LOOKUP,
         "menu_reference_text": MENU_REFERENCE_TEXT,
@@ -497,8 +495,6 @@ if DEMO_PHONE_NUMBER_ID:
         "access_token": DEMO_ACCESS_TOKEN,
         "owner_number": DEMO_OWNER_NUMBER,
         "name": DEMO_RESTAURANT_NAME,
-        # Used for this restaurant's own dashboard URL: /dashboard/demo
-        "slug": "demo",
         "categories": DEMO_CATEGORIES,
         "item_lookup": DEMO_ITEM_LOOKUP,
         "menu_reference_text": DEMO_MENU_REFERENCE_TEXT,
@@ -506,11 +502,6 @@ if DEMO_PHONE_NUMBER_ID:
         "greeting_text": DEMO_GREETING_TEXT,
         "faq_text": DEMO_FAQ_TEXT,
     }
-
-# Each restaurant gets its own dashboard at /dashboard/<slug>, so Tandoori's
-# staff only ever see Tandoori's orders and the demo dashboard only ever
-# shows demo orders - no mixing, no shared "all restaurants" view.
-SLUG_TO_RESTAURANT = {r["slug"]: r for r in RESTAURANTS.values()}
 
 app = Flask(__name__)
 # Sessions are now keyed by (restaurant phone_number_id, customer phone) so
@@ -840,27 +831,19 @@ def legacy_intent_reply(restaurant, session, phone, incoming_msg, intent):
     return "Abhi thoda dikkat ho rahi hai samajhne mein. MENU likhein ya item ka number/naam likhein."
 
 @app.route("/dashboard")
-@app.route("/dashboard/<slug>")
-def dashboard(slug="tandoori"):
-    # Each restaurant has its own dashboard, scoped to only its own orders -
-    # Tandoori's staff at /dashboard (or /dashboard/tandoori) never see demo
-    # orders, and /dashboard/demo never shows Tandoori's.
-    restaurant = SLUG_TO_RESTAURANT.get(slug)
-    if restaurant is None:
-        return f"Unknown restaurant '{slug}'. Try /dashboard/tandoori or /dashboard/demo.", 404
-
+def dashboard():
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
-        orders = conn.execute(
-            "SELECT * FROM orders WHERE restaurant_id=? ORDER BY id DESC",
-            (restaurant["phone_number_id"],)
-        ).fetchall()
+        orders = conn.execute("SELECT * FROM orders ORDER BY id DESC").fetchall()
 
     def parse_total(t):
         try:
             return int(str(t).replace("Rs", "").strip())
         except (TypeError, ValueError):
             return 0
+
+    def restaurant_name(rid):
+        return RESTAURANTS.get(rid, {}).get("name", "Unknown restaurant")
 
     # Every order is its own independent, individually-billed record - a customer
     # ordering twice in one day produces two separate rows with two separate totals,
@@ -884,7 +867,7 @@ def dashboard(slug="tandoori"):
 <!DOCTYPE html>
 <html>
 <head>
-    <title>{{ restaurant['name'] }} Dashboard</title>
+    <title>Restaurant Orders Dashboard</title>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
@@ -928,8 +911,8 @@ def dashboard(slug="tandoori"):
 </head>
 <body>
     <div class="header">
-        <h1>{{ restaurant['name'] }} Dashboard</h1>
-        <p>Order Management</p>
+        <h1>Restaurant Orders Dashboard</h1>
+        <p>Order Management - all restaurants on this deployment</p>
     </div>
     <div class="stats">
         <div class="stat-card"><h2>{{ orders|length }}</h2><p>Total Orders</p></div>
@@ -946,6 +929,7 @@ def dashboard(slug="tandoori"):
         {% if orders %}
             {% for order in orders %}
             <div class="order-card">
+                <div class="order-restaurant">{{ restaurant_name(order['restaurant_id']) }}</div>
                 <div class="order-header">
                     <span class="order-id">Order #{{ order['id'] }}</span>
                     <span class="order-time">{{ order['timestamp'] }}</span>
@@ -965,17 +949,14 @@ def dashboard(slug="tandoori"):
                 <div class="status-btns">
                     <form method="POST" action="/order/{{ order['id'] }}/status" style="display:inline;">
                         <input type="hidden" name="status" value="Pending">
-                        <input type="hidden" name="slug" value="{{ restaurant['slug'] }}">
                         <button type="submit" class="status-btn {{ 'active p' if (order['order_status'] or 'Pending') == 'Pending' else '' }}">Pending</button>
                     </form>
                     <form method="POST" action="/order/{{ order['id'] }}/status" style="display:inline;">
                         <input type="hidden" name="status" value="Dispatched">
-                        <input type="hidden" name="slug" value="{{ restaurant['slug'] }}">
                         <button type="submit" class="status-btn {{ 'active d' if order['order_status'] == 'Dispatched' else '' }}">Dispatched</button>
                     </form>
                     <form method="POST" action="/order/{{ order['id'] }}/status" style="display:inline;">
                         <input type="hidden" name="status" value="Delivered">
-                        <input type="hidden" name="slug" value="{{ restaurant['slug'] }}">
                         <button type="submit" class="status-btn {{ 'active v' if order['order_status'] == 'Delivered' else '' }}">Delivered</button>
                     </form>
                 </div>
@@ -1006,22 +987,17 @@ def dashboard(slug="tandoori"):
 </body>
 </html>
     """, orders=orders, daily_list=daily_list, today_orders=today_orders, pending_count=pending_count,
-         dispatched_count=dispatched_count, delivered_count=delivered_count, restaurant=restaurant)
+         dispatched_count=dispatched_count, delivered_count=delivered_count, restaurant_name=restaurant_name)
 
 @app.route("/order/<int:order_id>/status", methods=["POST"])
 def update_order_status(order_id):
     new_status = request.form.get("status", "Pending")
     if new_status not in ("Pending", "Dispatched", "Delivered"):
         new_status = "Pending"
-    # Which dashboard to bounce back to after saving - defaults to Tandoori's
-    # if the form somehow didn't send one, so this never 404s.
-    slug = request.form.get("slug", "tandoori")
-    if slug not in SLUG_TO_RESTAURANT:
-        slug = "tandoori"
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute("UPDATE orders SET order_status=? WHERE id=?", (new_status, order_id))
         conn.commit()
-    return ("", 303, {"Location": f"/dashboard/{slug}"})
+    return ("", 303, {"Location": "/dashboard"})
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
