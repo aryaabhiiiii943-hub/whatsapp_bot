@@ -33,8 +33,10 @@ OWNER_NUMBER = os.environ.get("OWNER_WHATSAPP_NUMBER", "918935842629")  # not a 
 # sending on the demo number, set DEMO_ACCESS_TOKEN explicitly to override. ---
 DEMO_PHONE_NUMBER_ID = os.environ.get("DEMO_PHONE_NUMBER_ID")
 DEMO_ACCESS_TOKEN = os.environ.get("DEMO_ACCESS_TOKEN") or META_ACCESS_TOKEN
-DEMO_OWNER_NUMBER = os.environ.get("DEMO_OWNER_WHATSAPP_NUMBER", OWNER_NUMBER)
-DEMO_RESTAURANT_NAME = os.environ.get("DEMO_RESTAURANT_NAME", "Rollicious")
+DEMO_OWNER_NUMBER = (os.environ.get("DEMO_OWNER_WHATSAPP_NUMBER")
+                     or os.environ.get("OWNER_WHATSAPP_NUMBER2")  # the var you added on Render = your number
+                     or OWNER_NUMBER)
+DEMO_RESTAURANT_NAME = os.environ.get("DEMO_RESTAURANT_NAME", "Embellish Salon & Studio")
 
 required_env_vars = {
     "GROQ_API_KEY": GROQ_API_KEY,
@@ -156,6 +158,24 @@ def build_order_alert_text(restaurant, row, is_reminder=False):
     """Owner/outlet-facing alert. Optimised for a shopkeeper glancing at their
     phone: order number + items to cook first, total in bold, then who/where
     to deliver. Uses WhatsApp *bold* markers for the bits that matter most."""
+    # Salon variant: it's a booking, so show the appointment time (stored in
+    # the location field) and prompt the owner to confirm the appointment.
+    if restaurant.get("mode") == "salon":
+        appt = row["location"]
+        appt_line = f"Appointment: {appt}" if appt and appt != "Not shared" else "Appointment: NOT SPECIFIED - call customer"
+        header = "*REMINDER - booking not yet confirmed*" if is_reminder else "*NEW BOOKING*"
+        return (
+            f"{header}  #{row['id']} - {restaurant['name']}\n"
+            f"{row['timestamp']}\n"
+            f"--------------------------------\n"
+            f"{row['order_text']}\n"
+            f"--------------------------------\n"
+            f"*TOTAL: {row['total']}*\n\n"
+            f"Customer: {row['phone']}\n"
+            f"{appt_line}\n\n"
+            f"Call the customer to confirm the appointment."
+        )
+
     loc = row["location"]
     if loc and loc != "Not shared":
         loc_line = f"Location: {loc}"
@@ -382,114 +402,87 @@ CATEGORIES = {
 }
 
 # ============================================================
-# Demo restaurant's menu (restaurant #2) - new, generic multi-category
-# menu, same shape as CATEGORIES above so all the shared logic below
-# works unchanged for either restaurant.
+# Demo business #2 - Embellish Salon & Studio (salon "mode").
+# Same data shape as CATEGORIES above (categories -> services with prices),
+# so all the shared browse/select/confirm logic works unchanged. Only the
+# final step differs (appointment time instead of a delivery location),
+# handled via the restaurant's "mode": "salon" flag further below.
 # ============================================================
 DEMO_CATEGORIES = {
     "1": {
-        "name": "Chicken & Egg Rolls",
-        "display": """1. Chicken Tikka Roll - Rs89
-2. Chicken Tikka Roll + Egg - Rs99
-3. Chicken Tikka Roll + Double Egg - Rs109
-4. Buna Chicken Roll - Rs79
-5. Buna Chicken Roll + Egg - Rs89
-6. Buna Chicken Roll + Double Egg - Rs99
-7. Chicken Malai Kabab Roll - Rs89
-8. Chicken Malai Kabab Roll + Egg - Rs99
-9. Chicken Malai Kabab Roll + Double Egg - Rs109
-10. Chicken Haryali Kabab Roll - Rs89
-11. Chicken Haryali Kabab Roll + Egg - Rs99
-12. Chicken Haryali Kabab Roll + Double Egg - Rs109
-13. Chicken Chilly Roll - Rs89
-14. Chicken Chilly Roll + Egg - Rs99
-15. Chicken Chilly Roll + Double Egg - Rs109
-16. Double Buna Chicken Roll - Rs99
-17. Double Buna Chicken Roll + Egg - Rs109
-18. Double Buna Chicken Roll + Double Egg - Rs119
-19. Egg Crust Roll - Rs59
-20. Double Egg Crust Roll - Rs69""",
+        "name": "Hair (Women & Men)",
+        "display": """1. Haircut (Women) - Rs300
+2. Haircut (Men) - Rs150
+3. Hair Wash & Blow Dry - Rs400
+4. Hair Spa - Rs1200
+5. Head Massage - Rs350
+6. Hair Smoothening - Rs3500
+7. Keratin Treatment - Rs4500
+8. Hair Colour (Global) - Rs2500
+9. Root Touch-up - Rs800""",
         "items_list": [
-            ("Chicken Tikka Roll", 89),
-            ("Chicken Tikka Roll + Egg", 99),
-            ("Chicken Tikka Roll + Double Egg", 109),
-            ("Buna Chicken Roll", 79),
-            ("Buna Chicken Roll + Egg", 89),
-            ("Buna Chicken Roll + Double Egg", 99),
-            ("Chicken Malai Kabab Roll", 89),
-            ("Chicken Malai Kabab Roll + Egg", 99),
-            ("Chicken Malai Kabab Roll + Double Egg", 109),
-            ("Chicken Haryali Kabab Roll", 89),
-            ("Chicken Haryali Kabab Roll + Egg", 99),
-            ("Chicken Haryali Kabab Roll + Double Egg", 109),
-            ("Chicken Chilly Roll", 89),
-            ("Chicken Chilly Roll + Egg", 99),
-            ("Chicken Chilly Roll + Double Egg", 109),
-            ("Double Buna Chicken Roll", 99),
-            ("Double Buna Chicken Roll + Egg", 109),
-            ("Double Buna Chicken Roll + Double Egg", 119),
-            ("Egg Crust Roll", 59),
-            ("Double Egg Crust Roll", 69),
+            ("Haircut (Women)", 300),
+            ("Haircut (Men)", 150),
+            ("Hair Wash & Blow Dry", 400),
+            ("Hair Spa", 1200),
+            ("Head Massage", 350),
+            ("Hair Smoothening", 3500),
+            ("Keratin Treatment", 4500),
+            ("Hair Colour (Global)", 2500),
+            ("Root Touch-up", 800),
         ]
     },
     "2": {
-        "name": "Veg Rolls",
-        "display": """1. Paneer Tikka Roll - Rs89
-2. Paneer Tikka Roll + Egg - Rs99
-3. Paneer Tikka Roll + Double Egg - Rs109
-4. Paneer Chilly Roll - Rs99
-5. Paneer Chilly Roll + Egg - Rs109
-6. Paneer Chilly Roll + Double Egg - Rs119
-7. Paneer Mushroom Fusion Roll - Rs99
-8. Paneer Mushroom Fusion Roll + Egg - Rs109
-9. Paneer Mushroom Fusion Roll + Double Egg - Rs119
-10. Aloo Chilly Roll - Rs79
-11. Aloo Chilly Roll + Egg - Rs89
-12. Aloo Chilly Roll + Double Egg - Rs109
-13. Mushroom Chilly Roll - Rs79
-14. Mushroom Chilly Roll + Egg - Rs89
-15. Mushroom Chilly Roll + Double Egg - Rs99
-16. Veg Delight Roll - Rs69
-17. Veg Delight Roll + Egg - Rs79
-18. Veg Delight Roll + Double Egg - Rs89""",
+        "name": "Skin & Facial",
+        "display": """1. Clean-up - Rs500
+2. Fruit Facial - Rs800
+3. Gold Facial - Rs1500
+4. De-Tan (Face) - Rs600
+5. Bleach - Rs400
+6. Eyebrow Threading - Rs50
+7. Upper Lip Threading - Rs30
+8. Full Face Threading - Rs120""",
         "items_list": [
-            ("Paneer Tikka Roll", 89),
-            ("Paneer Tikka Roll + Egg", 99),
-            ("Paneer Tikka Roll + Double Egg", 109),
-            ("Paneer Chilly Roll", 99),
-            ("Paneer Chilly Roll + Egg", 109),
-            ("Paneer Chilly Roll + Double Egg", 119),
-            ("Paneer Mushroom Fusion Roll", 99),
-            ("Paneer Mushroom Fusion Roll + Egg", 109),
-            ("Paneer Mushroom Fusion Roll + Double Egg", 119),
-            ("Aloo Chilly Roll", 79),
-            ("Aloo Chilly Roll + Egg", 89),
-            ("Aloo Chilly Roll + Double Egg", 109),
-            ("Mushroom Chilly Roll", 79),
-            ("Mushroom Chilly Roll + Egg", 89),
-            ("Mushroom Chilly Roll + Double Egg", 99),
-            ("Veg Delight Roll", 69),
-            ("Veg Delight Roll + Egg", 79),
-            ("Veg Delight Roll + Double Egg", 89),
+            ("Clean-up", 500),
+            ("Fruit Facial", 800),
+            ("Gold Facial", 1500),
+            ("De-Tan (Face)", 600),
+            ("Bleach", 400),
+            ("Eyebrow Threading", 50),
+            ("Upper Lip Threading", 30),
+            ("Full Face Threading", 120),
         ]
     },
     "3": {
-        "name": "Bahubali Rolls (Giant)",
-        "display": """Ek Mein Do Ka Maza!
-1. Triple Delight Bahubali Chicken - Rs170
-2. Veg Fusion Bahubali - Rs150""",
+        "name": "Nails & Waxing",
+        "display": """1. Manicure - Rs500
+2. Pedicure - Rs600
+3. Nail Extension - Rs1500
+4. Gel Polish - Rs800
+5. Full Arms Waxing - Rs300
+6. Full Legs Waxing - Rs500
+7. Full Body Waxing - Rs1500""",
         "items_list": [
-            ("Triple Delight Bahubali Chicken", 170),
-            ("Veg Fusion Bahubali", 150),
+            ("Manicure", 500),
+            ("Pedicure", 600),
+            ("Nail Extension", 1500),
+            ("Gel Polish", 800),
+            ("Full Arms Waxing", 300),
+            ("Full Legs Waxing", 500),
+            ("Full Body Waxing", 1500),
         ]
     },
     "4": {
-        "name": "Add-ons",
-        "display": """1. Laccha Paratha - Rs25
-2. Extra Cheese / Mayonnaise - Rs10""",
+        "name": "Bridal & Makeup",
+        "display": """1. Party Makeup - Rs2500
+2. Engagement Makeup - Rs5000
+3. Bridal Makeup - Rs12000
+4. Saree Draping - Rs500""",
         "items_list": [
-            ("Laccha Paratha", 25),
-            ("Extra Cheese / Mayonnaise", 10),
+            ("Party Makeup", 2500),
+            ("Engagement Makeup", 5000),
+            ("Bridal Makeup", 12000),
+            ("Saree Draping", 500),
         ]
     }
 }
@@ -557,36 +550,34 @@ Timings: 10 AM - 10 PM
 Phone: 9523087860
 Home Delivery available"""
 
-# Rollicious texts. Lookup + LLM menu reference are still derived from
-# DEMO_CATEGORIES; the customer-facing copy is Rollicious-branded.
+# Embellish Salon texts. Lookup + LLM service reference are derived from
+# DEMO_CATEGORIES; the customer-facing copy is Embellish-branded.
 DEMO_ITEM_LOOKUP = _build_item_lookup(DEMO_CATEGORIES)
 DEMO_MENU_REFERENCE_TEXT = _build_menu_reference(DEMO_CATEGORIES)
-DEMO_CATEGORY_MENU = """Rollicious Menu
-The Roll Company - Ek Mein Do Ka Maza
+DEMO_CATEGORY_MENU = """Embellish Salon & Studio
+Saheed Nagar, Bhubaneswar
 
-Konsi category chahiye?
+Konsi service category chahiye?
 
-1 - Chicken & Egg Rolls
-2 - Veg Rolls
-3 - Bahubali Rolls (Giant)
-4 - Add-ons
+1 - Hair (Cut, Spa, Colour, Smoothening)
+2 - Skin & Facial
+3 - Nails & Waxing
+4 - Bridal & Makeup
 
-Number bhejo!"""
-DEMO_GREETING_TEXT = """Rollicious mein aapka swagat hai!
-The Roll Company - Ek Mein Do Ka Maza
+Number bhejein!"""
+DEMO_GREETING_TEXT = """Embellish Salon & Studio mein aapka swagat hai!
+Saheed Nagar, Bhubaneswar
 
-Main aapki order lene ke liye yahan hoon!
+Main aapki appointment book karne ke liye yahan hoon!
 
-MENU likhein poora menu dekhne ke liye
-Ya seedha order karein - jaise 'chicken tikka roll' ya '2 paneer tikka roll'!"""
-DEMO_FAQ_TEXT = """Rollicious - The Roll Company
+MENU likhein saari services dekhne ke liye
+Ya seedha service ka naam likhein - jaise 'haircut' ya 'facial'!"""
+DEMO_FAQ_TEXT = """Embellish Salon & Studio
+Plot 59, Saheed Nagar, Bhubaneswar
 
-Order/Call: 9124890708
-Free Home Delivery
-Zomato & Swiggy pe bhi available
-Instagram: @rollicious_07
-
-Note: Payment advance/online hai - no credit."""
+Timings: 10 AM - 9 PM (daily)
+Appointments & walk-ins welcome
+Instagram: @embellishsalon"""
 
 # ============================================================
 # Restaurant registry - keyed by phone_number_id, which is exactly what
@@ -615,7 +606,8 @@ if DEMO_PHONE_NUMBER_ID:
         "access_token": DEMO_ACCESS_TOKEN,
         "owner_number": DEMO_OWNER_NUMBER,
         "name": DEMO_RESTAURANT_NAME,
-        "slug": "rollicious",
+        "slug": "embellish",
+        "mode": "salon",              # <-- switches the flow to appointment booking
         "categories": DEMO_CATEGORIES,
         "item_lookup": DEMO_ITEM_LOOKUP,
         "menu_reference_text": DEMO_MENU_REFERENCE_TEXT,
@@ -804,6 +796,40 @@ items: array of {{name, quantity}} using EXACT item names copied from the MENU a
 clear_cart_first: true if the customer's wording implies REPLACING their current order rather than adding to it (e.g. "sirf X aur kuch nahi", "only X", "bas itna hi chahiye", "cart clear karke X daal do") - this clears the existing cart before adding the new items. Also set true whenever intent is "clear_cart". Otherwise false.
 clarification_message: REQUIRED whenever intent is "unknown" - a specific, grounded, helpful answer per the question-handling section above, never a generic "samajh nahi aaya". Also use it for genuinely ambiguous cases under other intents. Otherwise an empty string."""
 
+    # Salon businesses use appointment/booking language instead of food/ordering.
+    # Same JSON schema and intent names - only the domain framing changes.
+    if restaurant.get("mode") == "salon":
+        system_prompt = f"""You are the WhatsApp appointment assistant for {restaurant['name']}, a beauty salon in Bhubaneswar. Customers write in English, Hindi, Hinglish, or broken/misspelled language and phrase things naturally - not just exact keywords. Understand what they mean using the SERVICES list below as your only source of truth, and reply like a warm salon receptionist.
+
+SERVICES (name - price):
+{restaurant['menu_reference_text']}
+
+Conversation state: stage={stage}, current_category={current_cat_name}, currently_selected={cart_summary}
+
+Return strict JSON only, following this logic:
+- intent "category": customer wants to browse a service category (by name or number), even casually (e.g. "hair wale services dikhao", "facial hai kya", "nails")
+- intent "order": customer EXPLICITLY names service(s) they want to BOOK (e.g. "haircut karwana hai", "facial and threading", "hair spa book karo"). This uses the "items" array.
+- intent "clear_cart": wants to reset the selected services (e.g. "sab hata do", "clear karo")
+- intent "cart": wants to see the services they've selected / the total
+- intent "confirm": customer is done selecting and ready to book - an affirmative OR "nothing more" reply (e.g. "haan", "yes", "done", "ho gaya", "bas", "itna hi", "book karo", "confirm"). IMPORTANT: currently_selected is {cart_summary}. If it is NOT empty, ANY short affirmative OR "no more" reply - INCLUDING a bare "nahi"/"no"/"nhi" after we ask "aur koi service?" - MUST be "confirm", NOT cancel.
+- intent "cancel": ONLY when they want to scrap everything / start over (e.g. "cancel", "rehne do", "mujhe kuch nahi chahiye")
+- intent "faq": asking about timings, address, phone, location
+- intent "back": wants the main service menu
+- intent "greeting": hi/hello/namaste with nothing else
+- intent "unknown": everything else - questions, small talk, vague fillers. NOT a dead end: always write a specific, helpful clarification_message grounded ONLY in the SERVICES above.
+
+HANDLING QUESTIONS (very common - never just say you don't understand): customers often ask instead of booking - "facial kitne ka hai", "bridal karte ho", "sabse sasta service kya hai", "hair colour hota hai kya". These are intent "unknown", but clarification_message must answer specifically from the SERVICES list:
+  - If the service EXISTS, confirm its exact name and price and ask if they'd like to book it.
+  - If it does NOT exist, say so politely and suggest 2-3 real alternatives that DO exist in the SERVICES list. Never invent a service or price.
+  - Keep it short and warm, in the customer's Hinglish/English mix.
+
+CRITICAL ANTI-HALLUCINATION RULE: Only put something in "items" if the customer EXPLICITLY names that service (or a clear typo/Hinglish version) AND wants to book it, not just asking if it exists. NEVER invent services or prices. A vague filler ("thik hai", "ok", "bas") with an EMPTY selection is intent "unknown" with EMPTY items; the same with a NON-empty selection is "confirm".
+
+category_number: the matching category number from the SERVICES above if intent is "category", else ""
+items: array of {{name, quantity}} using EXACT service names copied from the SERVICES above, only if intent is "order". Default quantity to 1.
+clear_cart_first: true if their wording implies replacing the current selection (e.g. "sirf X", "only X", "bas itna hi"). Also true whenever intent is "clear_cart". Otherwise false.
+clarification_message: REQUIRED whenever intent is "unknown" - specific and grounded per the rules above, never generic. Otherwise an empty string."""
+
     try:
         completion = groq_client.chat.completions.create(
             model="openai/gpt-oss-20b",
@@ -881,15 +907,24 @@ def add_items_and_reply(restaurant, session, items):
         parts.append("Kuch samajh nahi aaya. MENU likhein poora menu dekhne ke liye.")
     if added_lines:
         total_num = sum(i["price"] * i["qty"] for i in session["cart"])
-        parts.append(
-            f"Ab tak ka total: Rs{total_num}\n\n"
-            "Aur kuch chahiye? Item ka naam likhein.\n"
-            "Ho gaya toh 'DONE' likhein - phir sirf location maangenge."
-        )
+        if restaurant.get("mode") == "salon":
+            parts.append(
+                f"Ab tak ka total: Rs{total_num}\n\n"
+                "Aur koi service add karni hai? Service ka naam likhein.\n"
+                "Ho gaya toh 'DONE' likhein - phir appointment ka time poochenge."
+            )
+        else:
+            parts.append(
+                f"Ab tak ka total: Rs{total_num}\n\n"
+                "Aur kuch chahiye? Item ka naam likhein.\n"
+                "Ho gaya toh 'DONE' likhein - phir sirf location maangenge."
+            )
     return "\n\n".join(parts)
 
-def render_cart_reply(session):
+def render_cart_reply(restaurant, session):
     if session["cart"]:
+        if restaurant.get("mode") == "salon":
+            return f"{format_cart(session['cart'])}\n\nAppointment book karne ke liye 'DONE' likhein - phir aapse preferred din aur time poochenge."
         return f"{format_cart(session['cart'])}\n\nDelivery ke liye location share karein!\nWhatsApp mein attachment > Location > Send location"
     return "Cart empty hai! Item ka naam bhejein ya MENU likhein order karne ke liye."
 
@@ -901,10 +936,17 @@ def finalize_order(restaurant, session, phone):
     if not session["cart"]:
         return "Cart abhi empty hai! Pehle kuch order karein - item ka naam likhein."
 
-    # Location is mandatory - never place an order without a delivery pin, so
-    # every order that reaches the dashboard/kitchen has a location.
+    # For a salon we collect an APPOINTMENT TIME (free text) instead of a
+    # delivery pin. It's stored in the same session["location"] field / DB
+    # column so all the shared save/alert/dashboard logic keeps working.
     if not session.get("location"):
         session["stage"] = "awaiting_location"
+        if restaurant.get("mode") == "salon":
+            return (
+                f"{format_cart(session['cart'])}\n\n"
+                "Appointment ke liye apna preferred din aur time likhein - "
+                "jaise 'kal 5 PM' ya 'aaj shaam 6 baje'."
+            )
         return (
             f"{format_cart(session['cart'])}\n\n"
             "Order place karne ke liye apni LOCATION bhejein - WhatsApp mein "
@@ -931,7 +973,17 @@ def finalize_order(restaurant, session, phone):
         )
         conn.commit()
 
-    reply = f"""Order Confirmed - {restaurant['name']}!
+    if restaurant.get("mode") == "salon":
+        reply = f"""Appointment Confirmed - {restaurant['name']}!
+
+Aapki booking pakki ho gayi!
+Time: {session['location']}
+Humare staff aapko confirm karne ke liye jaldi call karenge.
+Slot se pehle ek reminder bhi bhejenge.
+
+Dhanyavaad!"""
+    else:
+        reply = f"""Order Confirmed - {restaurant['name']}!
 
 Aapka order place ho gaya!
 Delivery time: 30-45 minutes
@@ -979,13 +1031,16 @@ def legacy_intent_reply(restaurant, session, phone, incoming_msg, intent):
         session["current_category"] = None
         return restaurant["category_menu"]
     if intent == "cart":
-        return render_cart_reply(session)
+        return render_cart_reply(restaurant, session)
     if intent == "faq":
         return restaurant["faq_text"]
     if intent == "confirm":
         if session["cart"] and session.get("location"):
             return finalize_order(restaurant, session, phone)
         if session["cart"]:
+            if restaurant.get("mode") == "salon":
+                # finalize_order prompts for the appointment time when it's missing
+                return finalize_order(restaurant, session, phone)
             session["stage"] = "awaiting_location"
             return f"{format_cart(session['cart'])}\n\nOrder pakka! Ab apni LOCATION bhejein (attachment > Location). Location milte hi order place ho jayega."
         return "Cart abhi empty hai! Pehle kuch order karein - item ka naam likhein."
@@ -1467,8 +1522,18 @@ def webhook():
         numeric_single = re.match(r'^(\d+)$', stripped_msg)
         valid_category_numbers = list(restaurant["categories"].keys())
 
+        # --- Salon mode: when we're waiting for the appointment time, treat the
+        # customer's free-text reply as that time and place the booking. (Skip
+        # if they typed a command like menu/cancel/back so those still work.) ---
+        if (restaurant.get("mode") == "salon"
+                and session.get("stage") == "awaiting_location"
+                and stripped_msg and stripped_msg != "0"
+                and not any(k in stripped_msg.lower() for k in ("menu", "cancel", "back"))):
+            session["location"] = stripped_msg
+            reply = finalize_order(restaurant, session, phone)
+
         # --- Fast, free, deterministic path: picking an item by number while browsing a category ---
-        if session["stage"] == "subcategory" and (numeric_pair or numeric_single) and stripped_msg != "0":
+        elif session["stage"] == "subcategory" and (numeric_pair or numeric_single) and stripped_msg != "0":
             cat = restaurant["categories"].get(session["current_category"])
             items_list = cat["items_list"] if cat else []
             if numeric_pair:
@@ -1541,11 +1606,15 @@ def webhook():
                     reply = "Cart clear kar diya! Ab kya order karna hai? Item ka naam likhein, ya MENU likhein dekhne ke liye."
 
                 elif intent == "cart":
-                    reply = render_cart_reply(session)
+                    reply = render_cart_reply(restaurant, session)
 
                 elif intent == "confirm":
                     if not session["cart"]:
                         reply = "Cart abhi empty hai! Pehle kuch order karein - item ka naam likhein."
+                    elif restaurant.get("mode") == "salon":
+                        # salon: finalize_order asks for the appointment time if
+                        # it's not set yet, or places the booking if it is.
+                        reply = finalize_order(restaurant, session, phone)
                     elif session.get("location"):
                         # location already shared earlier - place it now
                         reply = finalize_order(restaurant, session, phone)
