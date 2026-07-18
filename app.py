@@ -678,7 +678,7 @@ def new_session():
 def detect_intent(msg):
     msg = msg.lower().strip()
     greetings = ["hi", "hello", "hii", "hey", "namaste", "helo", "hlo"]
-    menu_words = ["menu", "kya hai", "food", "khaana", "dishes", "list"]
+    menu_words = ["menu", "kya hai", "food", "khaana", "dishes", "list", "services", "service list", "sab dikhao"]
     confirm_words = ["haan", "yes", "ha", "confirm", "done", "bilkul", "hna", "han"]
     cancel_words = ["nahi", "no", "nhi", "cancel"]
     faq_words = ["address", "timing", "time", "kab", "kahan", "delivery", "phone", "contact"]
@@ -702,15 +702,19 @@ def detect_intent(msg):
         return "back"
     return "order"
 
-def format_cart(cart):
+def format_cart(cart, restaurant=None):
+    is_salon = bool(restaurant and restaurant.get("mode") == "salon")
     if not cart:
-        return "Cart empty hai!"
-    lines = ["Your Cart:"]
+        return "Abhi koi service select nahi hui hai!" if is_salon else "Cart empty hai!"
+    lines = ["Selected Services:" if is_salon else "Your Cart:"]
     total = 0
     for item in cart:
         subtotal = item["price"] * item["qty"]
         total += subtotal
-        lines.append(f"- {item['name']} x{item['qty']} = Rs{subtotal}")
+        if is_salon:
+            lines.append(f"- {item['name']} = Rs{subtotal}")
+        else:
+            lines.append(f"- {item['name']} x{item['qty']} = Rs{subtotal}")
     lines.append(f"TOTAL: Rs{total}")
     return "\n".join(lines)
 
@@ -814,7 +818,7 @@ Return strict JSON only, following this logic:
 - intent "confirm": customer is done selecting and ready to book - an affirmative OR "nothing more" reply (e.g. "haan", "yes", "done", "ho gaya", "bas", "itna hi", "book karo", "confirm"). IMPORTANT: currently_selected is {cart_summary}. If it is NOT empty, ANY short affirmative OR "no more" reply - INCLUDING a bare "nahi"/"no"/"nhi" after we ask "aur koi service?" - MUST be "confirm", NOT cancel.
 - intent "cancel": ONLY when they want to scrap everything / start over (e.g. "cancel", "rehne do", "mujhe kuch nahi chahiye")
 - intent "faq": asking about timings, address, phone, location
-- intent "back": wants the main service menu
+- intent "back": wants the main service menu / to see the full list of services (e.g. "services", "service list", "menu", "sab dikhao", "wapas")
 - intent "greeting": hi/hello/namaste with nothing else
 - intent "unknown": everything else - questions, small talk, vague fillers. NOT a dead end: always write a specific, helpful clarification_message grounded ONLY in the SERVICES above.
 
@@ -874,6 +878,8 @@ def show_category(restaurant, session, category_number):
         return restaurant["category_menu"]
     session["current_category"] = category_number
     session["stage"] = "subcategory"
+    if restaurant.get("mode") == "salon":
+        return f"{cat['name']}\n\n{cat['display']}\n\nJo service book karni hai uska number ya naam likhein.\nJaise: 3 (service number 3) ya 'facial'\n\n0 - wapas services pe"
     return f"{cat['name']}\n\n{cat['display']}\n\nItem number ya naam + quantity likhein!\nJaise: 3 2 (item 3, qty 2) ya 'chicken biryani 2'\n\nCART - cart dekhein\n0 - wapas menu pe"
 
 def add_items_and_reply(restaurant, session, items):
@@ -887,24 +893,38 @@ def add_items_and_reply(restaurant, session, items):
             qty = 1
         if resolved:
             session["cart"].append({"name": resolved["name"], "price": resolved["price"], "qty": qty})
-            added_lines.append(f"{resolved['name']} x{qty}")
+            if restaurant.get("mode") == "salon":
+                added_lines.append(f"{resolved['name']}")
+            else:
+                added_lines.append(f"{resolved['name']} x{qty}")
         else:
             not_found.append(it.get("name", "") or "?")
 
+    is_salon = restaurant.get("mode") == "salon"
     parts = []
     if added_lines:
         session["stage"] = "ordering"
-        parts.append("Add ho gaya:\n" + "\n".join(f"- {l}" for l in added_lines))
-    # If some named items were not on the menu, guide the customer with the
-    # actual menu instead of a dead-end "not found".
+        header = "Ye service select ho gayi:" if is_salon else "Add ho gaya:"
+        parts.append(header + "\n" + "\n".join(f"- {l}" for l in added_lines))
+    # If some named services/items weren't found, guide the customer with the list.
     if not_found:
-        parts.append(
-            "Yeh menu mein nahi mila: " + ", ".join(not_found)
-            + ".\nNeeche menu se sahi naam ya number bhejein:\n\n"
-            + restaurant["category_menu"]
-        )
+        if is_salon:
+            parts.append(
+                "Ye service nahi mili: " + ", ".join(not_found)
+                + ".\nNeeche list se sahi naam ya number bhejein:\n\n"
+                + restaurant["category_menu"]
+            )
+        else:
+            parts.append(
+                "Yeh menu mein nahi mila: " + ", ".join(not_found)
+                + ".\nNeeche menu se sahi naam ya number bhejein:\n\n"
+                + restaurant["category_menu"]
+            )
     if not added_lines and not not_found:
-        parts.append("Kuch samajh nahi aaya. MENU likhein poora menu dekhne ke liye.")
+        if is_salon:
+            parts.append("Samajh nahi aaya. SERVICES likhein saari services dekhne ke liye.")
+        else:
+            parts.append("Kuch samajh nahi aaya. MENU likhein poora menu dekhne ke liye.")
     if added_lines:
         total_num = sum(i["price"] * i["qty"] for i in session["cart"])
         if restaurant.get("mode") == "salon":
@@ -924,8 +944,8 @@ def add_items_and_reply(restaurant, session, items):
 def render_cart_reply(restaurant, session):
     if session["cart"]:
         if restaurant.get("mode") == "salon":
-            return f"{format_cart(session['cart'])}\n\nAppointment book karne ke liye 'DONE' likhein - phir aapse preferred din aur time poochenge."
-        return f"{format_cart(session['cart'])}\n\nDelivery ke liye location share karein!\nWhatsApp mein attachment > Location > Send location"
+            return f"{format_cart(session['cart'], restaurant)}\n\nAppointment book karne ke liye 'DONE' likhein - phir aapse preferred din aur time poochenge."
+        return f"{format_cart(session['cart'], restaurant)}\n\nDelivery ke liye location share karein!\nWhatsApp mein attachment > Location > Send location"
     return "Cart empty hai! Item ka naam bhejein ya MENU likhein order karne ke liye."
 
 def finalize_order(restaurant, session, phone):
@@ -943,12 +963,12 @@ def finalize_order(restaurant, session, phone):
         session["stage"] = "awaiting_location"
         if restaurant.get("mode") == "salon":
             return (
-                f"{format_cart(session['cart'])}\n\n"
+                f"{format_cart(session['cart'], restaurant)}\n\n"
                 "Appointment ke liye apna preferred din aur time likhein - "
                 "jaise 'kal 5 PM' ya 'aaj shaam 6 baje'."
             )
         return (
-            f"{format_cart(session['cart'])}\n\n"
+            f"{format_cart(session['cart'], restaurant)}\n\n"
             "Order place karne ke liye apni LOCATION bhejein - WhatsApp mein "
             "clip/attachment > Location > Send your current location.\n"
             "Location ke bina order place nahi hota."
@@ -1042,7 +1062,7 @@ def legacy_intent_reply(restaurant, session, phone, incoming_msg, intent):
                 # finalize_order prompts for the appointment time when it's missing
                 return finalize_order(restaurant, session, phone)
             session["stage"] = "awaiting_location"
-            return f"{format_cart(session['cart'])}\n\nOrder pakka! Ab apni LOCATION bhejein (attachment > Location). Location milte hi order place ho jayega."
+            return f"{format_cart(session['cart'], restaurant)}\n\nOrder pakka! Ab apni LOCATION bhejein (attachment > Location). Location milte hi order place ho jayega."
         return "Cart abhi empty hai! Pehle kuch order karein - item ka naam likhein."
     if intent == "cancel":
         session["stage"] = "welcome"
@@ -1544,9 +1564,15 @@ def webhook():
             if cat and 1 <= item_num <= len(items_list):
                 item_name, item_price = items_list[item_num - 1]
                 session["cart"].append({"name": item_name, "price": item_price, "qty": qty})
-                reply = f"{item_name} x{qty} cart mein add!\n\nAur add karna hai? Item number ya naam likhein.\nHo gaya toh DONE likhein.\nCART - cart dekhein | 0 - wapas menu pe"
+                if restaurant.get("mode") == "salon":
+                    reply = f"{item_name} select ho gayi ✅\n\nAur koi service chahiye? Number ya naam likhein.\nHo gaya toh DONE likhein appointment book karne ke liye.\n0 - wapas services pe"
+                else:
+                    reply = f"{item_name} x{qty} cart mein add!\n\nAur add karna hai? Item number ya naam likhein.\nHo gaya toh DONE likhein.\nCART - cart dekhein | 0 - wapas menu pe"
             else:
-                reply = f"Invalid number! 1 se {len(items_list)} ke beech likhein, ya item ka naam bhi likh sakte hain."
+                if restaurant.get("mode") == "salon":
+                    reply = f"Galat number! 1 se {len(items_list)} ke beech ka number likhein, ya service ka naam likhein."
+                else:
+                    reply = f"Invalid number! 1 se {len(items_list)} ke beech likhein, ya item ka naam bhi likh sakte hain."
 
         # --- Fast, free, deterministic path: picking a top-level category by digit ---
         elif numeric_single and stripped_msg in valid_category_numbers and session["stage"] != "subcategory":
@@ -1571,6 +1597,7 @@ def webhook():
             else:
                 intent = parsed.get("intent", "unknown")
                 print(f"[{restaurant['name']}] Stage: {session['stage']}, LLM intent: {intent}")
+                is_salon = restaurant.get("mode") == "salon"
 
                 if intent == "greeting" or (session["stage"] == "new" and intent == "unknown"):
                     reply = restaurant["greeting_text"]
@@ -1597,20 +1624,20 @@ def webhook():
                     if items:
                         reply = add_items_and_reply(restaurant, session, items)
                     elif parsed.get("clear_cart_first"):
-                        reply = "Cart clear kar diya! Ab kya order karna hai? Item ka naam likhein."
+                        reply = "Selection clear kar diya! Ab konsi service book karni hai? Naam likhein." if is_salon else "Cart clear kar diya! Ab kya order karna hai? Item ka naam likhein."
                     else:
-                        reply = parsed.get("clarification_message") or "Kya order karna hai? Item ka naam likhein, jaise 'chicken biryani' ya 'paneer tikka 2'."
+                        reply = parsed.get("clarification_message") or ("Konsi service book karni hai? Service ka naam likhein, jaise 'haircut' ya 'facial'." if is_salon else "Kya order karna hai? Item ka naam likhein, jaise 'chicken biryani' ya 'paneer tikka 2'.")
 
                 elif intent == "clear_cart":
                     session["cart"] = []
-                    reply = "Cart clear kar diya! Ab kya order karna hai? Item ka naam likhein, ya MENU likhein dekhne ke liye."
+                    reply = "Selection clear kar diya! Ab konsi service? Naam likhein, ya SERVICES likhein dekhne ke liye." if is_salon else "Cart clear kar diya! Ab kya order karna hai? Item ka naam likhein, ya MENU likhein dekhne ke liye."
 
                 elif intent == "cart":
                     reply = render_cart_reply(restaurant, session)
 
                 elif intent == "confirm":
                     if not session["cart"]:
-                        reply = "Cart abhi empty hai! Pehle kuch order karein - item ka naam likhein."
+                        reply = "Abhi koi service select nahi hui! Pehle service choose karein - naam likhein." if is_salon else "Cart abhi empty hai! Pehle kuch order karein - item ka naam likhein."
                     elif restaurant.get("mode") == "salon":
                         # salon: finalize_order asks for the appointment time if
                         # it's not set yet, or places the booking if it is.
@@ -1621,14 +1648,14 @@ def webhook():
                     else:
                         session["stage"] = "awaiting_location"
                         reply = (
-                            f"{format_cart(session['cart'])}\n\n"
+                            f"{format_cart(session['cart'], restaurant)}\n\n"
                             "Order pakka! Ab bas apni LOCATION bhejein - WhatsApp mein "
                             "clip/attachment > Location > Send your current location.\n"
                             "Location milte hi order place ho jayega."
                         )
 
                 elif intent == "cancel":
-                    reply = "Koi baat nahi! Cart clear kar diya. MENU likhein dobara order karne ke liye."
+                    reply = "Koi baat nahi! Selection clear kar diya. SERVICES likhein dobara shuru karne ke liye." if is_salon else "Koi baat nahi! Cart clear kar diya. MENU likhein dobara order karne ke liye."
                     session["stage"] = "welcome"
                     session["cart"] = []
                     session["current_category"] = None
@@ -1637,7 +1664,7 @@ def webhook():
                     reply = restaurant["faq_text"]
 
                 else:
-                    reply = parsed.get("clarification_message") or "Samajh nahi aaya! MENU likhein dekhne ke liye, ya seedha item ka naam bhejein jaise 'chicken biryani'."
+                    reply = parsed.get("clarification_message") or ("Samajh nahi aaya! SERVICES likhein dekhne ke liye, ya seedha service ka naam bhejein jaise 'haircut'." if is_salon else "Samajh nahi aaya! MENU likhein dekhne ke liye, ya seedha item ka naam bhejein jaise 'chicken biryani'.")
 
     send_meta_message(restaurant, phone, reply)
     return "ok", 200
