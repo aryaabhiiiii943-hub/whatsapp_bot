@@ -1573,6 +1573,84 @@ def webhook():
     send_meta_message(restaurant, phone, reply)
     return "ok", 200
 
+@app.route("/")
+def home():
+    """Aryanisation's public landing page - exists mainly so a real domain
+    pointed at this deployment has genuine business content on it, which
+    Meta's business verification checks for (a Facebook profile URL isn't
+    accepted as a "website"). Also doubles as the page restaurant owners
+    land on when onboarding."""
+    return render_template_string("""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Aryanisation - WhatsApp AI Ordering for Local Restaurants</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Aryanisation brings local restaurants onto WhatsApp with an AI ordering assistant - take orders directly from customers, no commission, no third-party app.">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; color: #222; background: #fff; line-height: 1.6; }
+        .hero { background: #e74c3c; color: white; padding: 70px 20px; text-align: center; }
+        .hero h1 { font-size: 34px; margin-bottom: 12px; }
+        .hero p { font-size: 17px; max-width: 560px; margin: 0 auto 24px; opacity: 0.95; }
+        .cta-btn { display: inline-block; background: white; color: #e74c3c; font-weight: bold; padding: 12px 28px; border-radius: 30px; text-decoration: none; font-size: 15px; }
+        .section { max-width: 800px; margin: 0 auto; padding: 50px 20px; }
+        .section h2 { font-size: 24px; margin-bottom: 20px; color: #e74c3c; }
+        .steps { display: flex; gap: 20px; flex-wrap: wrap; }
+        .step { flex: 1; min-width: 200px; background: #f9f9f9; border-radius: 10px; padding: 20px; }
+        .step h3 { color: #e74c3c; font-size: 16px; margin-bottom: 8px; }
+        .step p { font-size: 14px; color: #444; }
+        .why-list { list-style: none; }
+        .why-list li { padding: 10px 0; border-bottom: 1px solid #eee; font-size: 15px; }
+        .why-list li:before { content: "\\2713  "; color: #27ae60; font-weight: bold; }
+        footer { text-align: center; padding: 30px 20px; color: #999; font-size: 13px; border-top: 1px solid #eee; }
+        footer a { color: #e74c3c; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="hero">
+        <h1>Aryanisation</h1>
+        <p>We bring local restaurants onto WhatsApp with an AI ordering assistant - so you can take orders directly from customers, keep full control of your business, and stop depending on commission-heavy delivery apps.</p>
+        <a class="cta-btn" href="https://wa.me/{{ owner_number }}?text=Hi%2C%20I%27d%20like%20to%20get%20my%20restaurant%20onto%20Aryanisation" target="_blank">Get Your Restaurant Onboarded</a>
+    </div>
+
+    <div class="section">
+        <h2>How it works</h2>
+        <div class="steps">
+            <div class="step">
+                <h3>1. Customer messages you</h3>
+                <p>Your customers order directly on WhatsApp - no app download, no signup, just a chat.</p>
+            </div>
+            <div class="step">
+                <h3>2. Our AI takes the order</h3>
+                <p>The assistant understands Hindi, English and Hinglish, walks them through your menu, and confirms the order.</p>
+            </div>
+            <div class="step">
+                <h3>3. You get notified instantly</h3>
+                <p>Every order lands straight on your phone and on a live dashboard - ready to prepare and dispatch.</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Why restaurants choose Aryanisation</h2>
+        <ul class="why-list">
+            <li>No per-order commission - you keep what you earn</li>
+            <li>Customers order the same way they already message you</li>
+            <li>Live order dashboard with instant alerts</li>
+            <li>Works in Hindi, English and Hinglish, out of the box</li>
+            <li>Set up in days, not weeks</li>
+        </ul>
+    </div>
+
+    <footer>
+        Aryanisation &middot; <a href="/privacy">Privacy Policy</a>
+    </footer>
+</body>
+</html>
+    """, owner_number=OWNER_NUMBER)
+
 @app.route("/privacy")
 def privacy():
     return render_template_string("""
